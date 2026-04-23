@@ -1,0 +1,1 @@
+alibabacloud_dingtalk>=2.2.39
