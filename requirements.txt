@@ -1,1 +1,5 @@
-alibabacloud_dingtalk>=2.2.39
+dingtalk-stream
+python-dotenv
+requests
+playwright
+ddddocr

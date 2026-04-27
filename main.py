@@ -1,275 +1,889 @@
-import argparse
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+钉钉物流查询机器人
+接收FBA编号，查询钉钉表格并回复物流信息
+"""
+
+import asyncio
 import json
-import os
-from typing import Any
+import logging
+import mimetypes
+import re
+import sys
+import time
+from datetime import datetime
+import dingtalk_stream
+import requests
+from dotenv import load_dotenv
 
-from alibabacloud_dingtalk.notable_2_0.client import Client as NotableClient
-from alibabacloud_dingtalk.notable_2_0 import models as notable_models
-from alibabacloud_dingtalk.oauth2_1_0.client import Client as OAuthClient
-from alibabacloud_dingtalk.oauth2_1_0 import models as oauth_models
-from alibabacloud_tea_openapi import models as open_api_models
-from alibabacloud_tea_util import models as util_models
+from logistics_query import (
+    BaosenLoginError,
+    load_env,
+    find_order_by_fba,
+    query_meitong,
+    query_agl,
+    query_17track,
+    query_baosen,
+    query_pingyi,
+    decide_platform,
+    get_primary_logistics_no,
+    get_dingtalk_access_token,
+)
+from qq_query import query_qq
+from wechat_query import get_wechat_provider, query_wechat
+from pathlib import Path
+from dingtalk_stream.utils import DINGTALK_OPENAPI_ENDPOINT
+
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)-8s %(message)s',
+)
+logger = logging.getLogger(__name__)
+
+_MESSAGE_DEDUP_TTL_SECONDS = 300
+_TRACK_QUERY_MAX_ATTEMPTS = 3
+_TRACK_QUERY_RETRY_DELAY_SECONDS = 2
+_SERIAL_BROWSER_TRACKING_PLATFORMS = {'agl', 'pingyi', 'baosen', '17track'}
 
 
-def load_env_file(env_path: str = ".env") -> None:
-    if not os.path.exists(env_path):
-        return
+def _parse_track_time(value: str) -> datetime | None:
+    text = (value or '').strip()
+    if not text:
+        return None
 
-    with open(env_path, "r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip("'").strip('"')
-            os.environ.setdefault(key, value)
-
-
-def build_openapi_config() -> open_api_models.Config:
-    return open_api_models.Config(protocol="https", region_id="central")
-
-
-def get_access_token(app_key: str, app_secret: str) -> str:
-    client = OAuthClient(build_openapi_config())
-    request = oauth_models.GetAccessTokenRequest(
-        app_key=app_key,
-        app_secret=app_secret,
+    chinese_match = __import__('re').match(
+        r'^(\d{4})年(\d{1,2})月(\d{1,2})日(?:\s*GMT[+-]\d+)?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?$',
+        text,
     )
-    response = client.get_access_token(request)
-    if not response.body or not response.body.access_token:
-        raise RuntimeError(f"failed to get access token: {response.to_map()}")
-    return response.body.access_token
-
-
-class AITableClient:
-    def __init__(self, access_token: str, base_id: str):
-        self.base_id = base_id
-        self.client = NotableClient(build_openapi_config())
-        self.runtime = util_models.RuntimeOptions()
-        self.headers = notable_models.GetAllSheetsHeaders(
-            x_acs_dingtalk_access_token=access_token
+    if chinese_match:
+        year, month, day, hour, minute, second = chinese_match.groups()
+        return datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            int(second or 0),
         )
 
-    def _headers(self, cls: type[Any]) -> Any:
-        return cls(x_acs_dingtalk_access_token=self.headers.x_acs_dingtalk_access_token)
+    normalized = text.replace('UTC', '').replace('T', ' ').strip()
+    formats = [
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d %H:%M',
+        '%Y/%m/%d %H:%M:%S',
+        '%Y/%m/%d %H:%M',
+        '%Y-%m-%d',
+        '%Y/%m/%d',
+        '%m/%d/%Y %H:%M:%S',
+        '%m/%d/%Y %H:%M',
+        '%m/%d/%Y',
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
 
-    def list_sheets(self) -> dict[str, Any]:
-        response = self.client.get_all_sheets_with_options(
-            self.base_id,
-            self._headers(notable_models.GetAllSheetsHeaders),
-            self.runtime,
-        )
-        return response.to_map()
 
-    def get_sheet(self, sheet_id_or_name: str) -> dict[str, Any]:
-        response = self.client.get_sheet_with_options(
-            self.base_id,
-            sheet_id_or_name,
-            self._headers(notable_models.GetSheetHeaders),
-            self.runtime,
-        )
-        return response.to_map()
+def _sort_tracks_newest_first(tracks: list[dict]) -> list[dict]:
+    indexed = list(enumerate(tracks))
 
-    def create_sheet(self, name: str) -> dict[str, Any]:
-        request = notable_models.CreateSheetRequest(name=name)
-        response = self.client.create_sheet_with_options(
-            self.base_id,
-            request,
-            self._headers(notable_models.CreateSheetHeaders),
-            self.runtime,
-        )
-        return response.to_map()
+    def sort_key(item):
+        index, track = item
+        parsed = _parse_track_time(str(track.get('时间', '')))
+        return (parsed is not None, parsed or datetime.min, -index)
 
-    def list_records(
-        self,
-        sheet_id_or_name: str,
-        max_results: int = 100,
-        next_token: str | None = None,
-    ) -> dict[str, Any]:
-        request = notable_models.GetRecordsRequest(
-            max_results=max_results,
-            next_token=next_token,
-        )
-        response = self.client.get_records_with_options(
-            self.base_id,
-            sheet_id_or_name,
-            request,
-            self._headers(notable_models.GetRecordsHeaders),
-            self.runtime,
-        )
-        return response.to_map()
+    sorted_items = sorted(indexed, key=sort_key, reverse=True)
+    return [track for _, track in sorted_items]
 
-    def get_record(self, sheet_id_or_name: str, record_id: str) -> dict[str, Any]:
-        response = self.client.get_record_with_options(
-            self.base_id,
-            sheet_id_or_name,
-            record_id,
-            self._headers(notable_models.GetRecordHeaders),
-            self.runtime,
-        )
-        return response.to_map()
 
-    def insert_records(self, sheet_id_or_name: str, records: list[dict[str, Any]]) -> dict[str, Any]:
-        request = notable_models.InsertRecordsRequest(
-            records=[
-                notable_models.InsertRecordsRequestRecords(fields=record)
-                for record in records
-            ]
-        )
-        response = self.client.insert_records_with_options(
-            self.base_id,
-            sheet_id_or_name,
-            request,
-            self._headers(notable_models.InsertRecordsHeaders),
-            self.runtime,
-        )
-        return response.to_map()
+def _normalize_track_content(track: dict) -> dict:
+    normalized = dict(track)
+    content = str(normalized.get('内容', '') or '').strip()
+    if content:
+        half = len(content) // 2
+        if half > 0 and len(content) % 2 == 0 and content[:half] == content[half:]:
+            normalized['内容'] = content[:half]
+            return normalized
 
-    def update_records(self, sheet_id_or_name: str, records: list[dict[str, Any]]) -> dict[str, Any]:
-        request = notable_models.UpdateRecordsRequest(
-            records=[
-                notable_models.UpdateRecordsRequestRecords(
-                    id=record["id"],
-                    fields=record["fields"],
+        for prefix in ('已预订：', '装货港口：', '运输途中：', '卸货港口：', '正在配送：', '已配送至亚马逊运营中心：'):
+            if content.startswith(prefix):
+                payload = content[len(prefix):].strip()
+                half = len(payload) // 2
+                if half > 0 and len(payload) % 2 == 0 and payload[:half] == payload[half:]:
+                    normalized['内容'] = f"{prefix}{payload[:half]}"
+                break
+    return normalized
+
+
+def _extract_wechat_query_value(message_content: str) -> str:
+    compact = (message_content or '').strip()
+    if '微信' not in compact:
+        return ''
+
+    without_keyword = compact.replace('微信', ' ')
+    tokens = [
+        token.strip()
+        for token in re.split(r'[\s,，;；|｜]+', without_keyword)
+        if token.strip()
+    ]
+    if not tokens:
+        return ''
+    return tokens[-1]
+
+
+class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
+    """物流查询机器人处理器"""
+
+    def __init__(self):
+        super().__init__()
+        self.logger = logging.getLogger(__name__)
+        self._message_seen_at: dict[str, float] = {}
+        self._browser_query_lock = asyncio.Lock()
+        self._browser_queue_waiting = 0
+        self._qq_query_lock = asyncio.Lock()
+        self._qq_queue_waiting = 0
+        self._background_tasks: set[asyncio.Task] = set()
+
+    async def process(self, callback: dingtalk_stream.CallbackMessage):
+        """处理接收到的消息"""
+        try:
+            incoming_message = dingtalk_stream.ChatbotMessage.from_dict(callback.data)
+            self._purge_expired_messages()
+
+            # 获取发送者信息
+            sender_nick = incoming_message.sender_nick
+            conversation_id = incoming_message.conversation_id
+            text_body = getattr(incoming_message, 'text', None)
+            message_content = ''
+            if text_body is not None:
+                message_content = (getattr(text_body, 'content', '') or '').strip()
+            dedup_key = self._build_message_dedup_key(callback, incoming_message, message_content)
+
+            if self._is_duplicate_message(dedup_key):
+                self.logger.info("忽略重复消息 - 发送者: %s, 内容: %s", sender_nick, message_content)
+                return dingtalk_stream.AckMessage.STATUS_OK, 'DUPLICATE'
+
+            self._mark_message_seen(dedup_key)
+
+            self.logger.info(f"收到消息 - 发送者: {sender_nick}, 内容: {message_content}")
+
+            # 简单处理：只处理文本消息
+            if incoming_message.message_type == 'text':
+                if not message_content:
+                    self.logger.info("收到空文本消息 - 发送者: %s", sender_nick)
+                    self.reply_text("请发送纯文本格式的FBA编号进行查询", incoming_message)
+                    return dingtalk_stream.AckMessage.STATUS_OK, 'EMPTY_TEXT'
+                await self._handle_text_message(incoming_message, message_content)
+            else:
+                self.logger.info(
+                    "收到非文本消息 - 发送者: %s, message_type: %s",
+                    sender_nick,
+                    incoming_message.message_type,
                 )
-                for record in records
-            ]
-        )
-        response = self.client.update_records_with_options(
-            self.base_id,
-            sheet_id_or_name,
-            request,
-            self._headers(notable_models.UpdateRecordsHeaders),
-            self.runtime,
-        )
-        return response.to_map()
+                self.reply_text("请发送FBA编号进行查询", incoming_message)
 
-    def delete_records(self, sheet_id_or_name: str, record_ids: list[str]) -> dict[str, Any]:
-        request = notable_models.DeleteRecordsRequest(record_ids=record_ids)
-        response = self.client.delete_records_with_options(
-            self.base_id,
-            sheet_id_or_name,
-            request,
-            self._headers(notable_models.DeleteRecordsHeaders),
-            self.runtime,
+            return dingtalk_stream.AckMessage.STATUS_OK, 'OK'
+
+        except Exception as e:
+            self.logger.error(f"处理消息失败: {e}", exc_info=True)
+            return dingtalk_stream.AckMessage.STATUS_OK, 'ERROR'
+
+    def _build_message_dedup_key(self, callback, incoming_message, message_content: str) -> str:
+        candidates = [
+            getattr(callback, 'message_id', None),
+            getattr(incoming_message, 'message_id', None),
+            getattr(incoming_message, 'msg_id', None),
+        ]
+        for candidate in candidates:
+            if candidate:
+                return f"msg:{candidate}"
+
+        sender = getattr(incoming_message, 'sender_staff_id', None) or getattr(incoming_message, 'sender_id', None) or incoming_message.sender_nick
+        conversation = getattr(incoming_message, 'conversation_id', '')
+        return f"fallback:{conversation}:{sender}:{message_content}"
+
+    def _is_duplicate_message(self, dedup_key: str) -> bool:
+        seen_at = self._message_seen_at.get(dedup_key)
+        if seen_at is None:
+            return False
+        return time.time() - seen_at < _MESSAGE_DEDUP_TTL_SECONDS
+
+    def _mark_message_seen(self, dedup_key: str) -> None:
+        self._message_seen_at[dedup_key] = time.time()
+
+    def _purge_expired_messages(self) -> None:
+        now = time.time()
+        expired = [key for key, seen_at in self._message_seen_at.items() if now - seen_at >= _MESSAGE_DEDUP_TTL_SECONDS]
+        for key in expired:
+            self._message_seen_at.pop(key, None)
+
+    async def _handle_text_message(self, incoming_message, text_content: str):
+        """处理文本消息"""
+        fba_code = text_content.strip()
+
+        if not fba_code:
+            self.reply_text("请发送要查询的FBA编号", incoming_message)
+            return
+
+        wechat_query_value = _extract_wechat_query_value(text_content)
+        if wechat_query_value:
+            self.logger.info("开始微信查询 query=%s", wechat_query_value)
+            self.reply_text(f"收到，开始走微信查询 {wechat_query_value} ...", incoming_message)
+            try:
+                result = await asyncio.to_thread(query_wechat, wechat_query_value)
+                error = str(result.get('错误', '') or '').strip()
+                if error:
+                    reply_text = f"❌ 微信查询失败: {error}"
+                else:
+                    reply_lines = [
+                        f"📱 微信查询已发送\n"
+                        f"群聊: {result.get('群名', '')}\n"
+                        f"询问对象: {result.get('询问对象', '')}\n"
+                        f"查询值: {result.get('查询值', '')}\n"
+                        f"提问内容: {result.get('提问内容', '')}"
+                    ]
+                    latest_track = result.get('最新轨迹') or {}
+                    track_content = str(latest_track.get('内容', '') or '').strip()
+                    if get_wechat_provider() == 'gewechat' and track_content:
+                        track_time = str(latest_track.get('时间', '') or '').strip()
+                        reply_lines.append(
+                            "\n\n💬 微信最新回复:\n"
+                            + (f"{track_time}: {track_content}" if track_time else track_content)
+                        )
+                    reply_text = ''.join(reply_lines)
+                self.reply_text(reply_text, incoming_message)
+                self.logger.info("微信查询完成 query=%s", wechat_query_value)
+            except Exception as e:
+                self.logger.error("微信查询失败: %s", e, exc_info=True)
+                self.reply_text(f"❌ 微信查询失败: {str(e)}", incoming_message)
+            return
+
+        # 先回复收到
+        self.logger.info("开始查询 FBA=%s", fba_code)
+        self.reply_text(f"收到，开始查询 {fba_code} ...", incoming_message)
+
+        # 查询表格
+        try:
+            order = find_order_by_fba(fba_code)
+
+            if order:
+                # 格式化回复消息
+                reply_text = self._format_order_info(order, fba_code)
+                platform = decide_platform(order, 'auto')
+                if platform == 'qq':
+                    reply_text += self._build_qq_pending_reply(order)
+                    self.reply_text(reply_text, incoming_message)
+                    self._schedule_qq_follow_up(incoming_message, order, fba_code)
+                    self.logger.info("查询完成 FBA=%s", fba_code)
+                    return
+
+                reply_text += await self._query_tracking_info(order, fba_code)
+            else:
+                reply_text = f"❌ 未找到FBA编号 {fba_code} 的记录"
+
+            self.reply_text(reply_text, incoming_message)
+            self.logger.info("查询完成 FBA=%s", fba_code)
+
+        except Exception as e:
+            self.logger.error(f"查询失败: {e}", exc_info=True)
+            self.reply_text(f"❌ 查询失败: {str(e)}", incoming_message)
+
+    def _build_qq_pending_reply(self, order: dict) -> str:
+        tracking_no = get_primary_logistics_no(order)
+        if not tracking_no:
+            return '\n\n⚠️ 钉钉表格中缺少物流编号，暂时无法发起 QQ 人工查询'
+        return (
+            f"\n\n⏳ 已发起 QQ 人工查询({tracking_no})"
+            "\n💬 该查询依赖人工回复，结果会在收到回复后单独补发"
         )
-        return response.to_map()
+
+    def _schedule_qq_follow_up(self, incoming_message, order: dict, fba_code: str) -> None:
+        task = asyncio.create_task(self._run_qq_follow_up(incoming_message, order, fba_code))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_qq_follow_up(self, incoming_message, order: dict, fba_code: str) -> None:
+        try:
+            result = await self._query_qq_result(order, fba_code)
+            self._reply_qq_result(incoming_message, fba_code, result)
+            self.logger.info("QQ 异步回推完成 FBA=%s", fba_code)
+        except Exception as e:
+            self.logger.error("QQ 异步回推失败 FBA=%s error=%s", fba_code, e, exc_info=True)
+            self.reply_text(f"📦 FBA编号: {fba_code}\n\n❌ QQ 查询失败: {str(e)}", incoming_message)
+
+    async def _query_qq_result(self, order: dict, fba_code: str) -> dict:
+        tracking_no = get_primary_logistics_no(order)
+        if not tracking_no:
+            return {
+                '平台': 'QQ',
+                '查询值': '',
+                '物流轨迹': [],
+                '最新轨迹': {},
+                '错误': '钉钉表格中缺少物流编号，暂时无法查询物流轨迹',
+            }
+        self.logger.info("轨迹查询: 平台=QQ 物流编号=%s", tracking_no)
+        return await self._run_qq_query_with_queue(
+            platform='QQ',
+            query_value=tracking_no,
+            operation=lambda: asyncio.to_thread(query_qq, order, tracking_no),
+        )
+
+    def _reply_qq_result(self, incoming_message, fba_code: str, result: dict) -> None:
+        tracking_info = self._format_tracking_result(result, 'qq')
+        reply_text = f"📦 FBA编号: {fba_code}{tracking_info}"
+        self.reply_text(reply_text, incoming_message)
+
+        latest_track = result.get('最新轨迹') or {}
+        attachments = latest_track.get('附件') or []
+        if attachments:
+            self._reply_qq_attachments(incoming_message, attachments)
+
+    def _reply_qq_attachments(self, incoming_message, attachments: list[dict]) -> None:
+        for index, attachment in enumerate(attachments, start=1):
+            asset_type = str(attachment.get('类型', '') or '').strip()
+            name = str(attachment.get('名称', '') or '').strip()
+            url = str(attachment.get('链接', '') or '').strip()
+            if not url:
+                fallback = f"附件{index}"
+                label = f"[{asset_type}] {name}".strip() if asset_type or name else fallback
+                self.reply_text(f"⚠️ {label}\n未提供可下载链接", incoming_message)
+                continue
+
+            try:
+                if asset_type == '图片':
+                    self._reply_dingtalk_image(incoming_message, url, name or f'qq-image-{index}.jpg')
+                elif asset_type == '文件':
+                    self._reply_dingtalk_file(incoming_message, url, name or f'qq-file-{index}')
+                else:
+                    self.reply_markdown(
+                        title='QQ附件',
+                        text=f"[{asset_type or '附件'}] {name or url}\n\n{url}",
+                        incoming_message=incoming_message,
+                    )
+            except Exception as exc:
+                self.logger.warning("转发 QQ 附件失败: type=%s name=%s url=%s error=%s", asset_type, name, url, exc)
+                label = f"[{asset_type}] {name}".strip() if asset_type or name else url
+                self.reply_text(f"⚠️ 附件转发失败: {label}\n{url}", incoming_message)
+
+    def _reply_qq_attachment_link(self, incoming_message, asset_type: str, name: str, url: str) -> None:
+        label = name or url
+        title = f"QQ{asset_type or '附件'}"
+        self.reply_markdown(
+            title=title,
+            text=f"**{title}**\n\n{label}\n\n{url}",
+            incoming_message=incoming_message,
+        )
+
+    def _download_remote_asset(self, url: str) -> tuple[bytes, str]:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        content_type = response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+        return response.content, content_type
+
+    def _normalize_upload_filename(self, filename: str, content_type: str, default_stem: str) -> str:
+        raw_name = (filename or '').strip()
+        suffix = Path(raw_name).suffix
+        guessed_suffix = mimetypes.guess_extension(content_type or '') or ''
+
+        if not suffix and guessed_suffix:
+            suffix = guessed_suffix
+
+        stem = Path(raw_name).stem if raw_name else ''
+        if not stem or stem.startswith('['):
+            stem = default_stem
+
+        safe_stem = re.sub(r'[^A-Za-z0-9._-]+', '-', stem).strip('-._') or default_stem
+        return f'{safe_stem}{suffix}'
+
+    def _reply_dingtalk_robot_message(self, incoming_message, msg_key: str, msg_param: dict) -> dict | None:
+        access_token = self.dingtalk_client.get_access_token()
+        if not access_token:
+            raise RuntimeError('无法获取钉钉 access token')
+
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': '*/*',
+            'x-acs-dingtalk-access-token': access_token,
+        }
+        body = {
+            'msgKey': msg_key,
+            'msgParam': json.dumps(msg_param, ensure_ascii=False),
+            'robotCode': self.dingtalk_client.credential.client_id,
+        }
+
+        if incoming_message.conversation_type == '2':
+            if not incoming_message.conversation_id:
+                raise RuntimeError('缺少 conversation_id，无法发送群附件消息')
+            body['openConversationId'] = incoming_message.conversation_id
+            endpoint = '/v1.0/robot/groupMessages/send'
+        elif incoming_message.conversation_type == '1':
+            sender_staff_id = getattr(incoming_message, 'sender_staff_id', '') or getattr(incoming_message, 'sender_id', '')
+            if not sender_staff_id:
+                raise RuntimeError('缺少 sender_staff_id，无法发送单聊附件消息')
+            body['userIds'] = [sender_staff_id]
+            self.logger.info(
+                "钉钉单聊附件发送: sender_staff_id=%s sender_id=%s conversation_id=%s msgKey=%s",
+                sender_staff_id,
+                getattr(incoming_message, 'sender_id', '') or '',
+                incoming_message.conversation_id,
+                msg_key,
+            )
+            endpoint = '/v1.0/robot/oToMessages/batchSend'
+        else:
+            raise RuntimeError(f'不支持的会话类型，无法发送附件消息: {incoming_message.conversation_type}')
+
+        response = requests.post(
+            DINGTALK_OPENAPI_ENDPOINT + endpoint,
+            headers=headers,
+            json=body,
+            timeout=30,
+        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(
+                f'钉钉附件消息发送失败: status={response.status_code} body={response.text}'
+            ) from exc
+        return response.json()
+
+    def _reply_dingtalk_image(self, incoming_message, url: str, filename: str) -> None:
+        self._reply_dingtalk_robot_message(
+            incoming_message,
+            msg_key='sampleImageMsg',
+            msg_param={
+                'photoURL': url,
+            },
+        )
+
+    def _reply_dingtalk_file(self, incoming_message, url: str, filename: str) -> None:
+        content, content_type = self._download_remote_asset(url)
+        filename = self._normalize_upload_filename(filename, content_type, 'qq-file')
+        suffix = Path(filename).suffix.lower().lstrip('.')
+        if not suffix:
+            guessed = mimetypes.guess_extension(content_type or '') or ''
+            suffix = guessed.lstrip('.')
+            if guessed and not filename.endswith(guessed):
+                filename = f'{filename}{guessed}'
+        media_id = self.dingtalk_client.upload_to_dingtalk(
+            content,
+            filetype='file',
+            filename=filename,
+            mimetype=content_type or 'application/octet-stream',
+        )
+        if not media_id:
+            raise RuntimeError('文件上传到钉钉失败')
+        self._reply_dingtalk_robot_message(
+            incoming_message,
+            msg_key='sampleFile',
+            msg_param={
+                'mediaId': media_id,
+                'fileName': filename,
+                'fileType': suffix or 'pdf',
+            },
+        )
+
+    def _format_tracking_result(self, result: dict, platform: str, query_value: str | None = None) -> str:
+        normalized_platform = str(result.get('平台', platform) or platform).strip()
+        display_query_value = (query_value or result.get('查询值') or '').strip()
+        tracks = [_normalize_track_content(track) for track in _sort_tracks_newest_first(result.get('物流轨迹') or [])]
+
+        if not tracks:
+            error = str(result.get('错误', '') or '').strip()
+            if error:
+                if normalized_platform.upper() == 'QQ' and '等待 QQ 回复超时' in error:
+                    self.logger.info(
+                        "轨迹查询结果: 平台=%s 查询值=%s QQ超时无回复，按空结果处理",
+                        normalized_platform,
+                        display_query_value,
+                    )
+                    return ''
+                self.logger.warning(
+                    "轨迹查询结果: 平台=%s 查询值=%s 错误=%s",
+                    normalized_platform,
+                    display_query_value,
+                    error,
+                )
+                return f"\n\n⚠️ 物流轨迹查询失败: {error}"
+            self.logger.info(
+                "轨迹查询结果: 平台=%s 查询值=%s 无轨迹",
+                normalized_platform,
+                display_query_value,
+            )
+            return f"\n\n暂无{normalized_platform.upper()}物流轨迹信息"
+
+        latest_track = tracks[0]
+        self.logger.info(
+            "轨迹查询结果: 平台=%s 查询值=%s 条数=%s 最新=%s | %s",
+            normalized_platform,
+            display_query_value,
+            len(tracks),
+            latest_track.get('时间', ''),
+            latest_track.get('内容', '') or latest_track.get('地点', ''),
+        )
+
+        lines = []
+        if display_query_value:
+            lines.append(f"\n\n正在查询物流轨迹({display_query_value})...")
+        lines.append(f"\n📦 最新物流轨迹({normalized_platform}) - 按时间倒序:")
+
+        result_source = str(result.get('结果来源', '') or '').strip()
+        if result_source:
+            lines.append(f"\n📚 结果来源: {result_source}")
+
+        for track in tracks[:5]:
+            time_str = str(track.get('时间', '') or '').strip()
+            content = str(track.get('内容', '') or track.get('地点', '') or '').strip()
+            tracking_no = str(track.get('单号', '') or '').strip()
+            if tracking_no and time_str and content:
+                lines.append(f"\n• {time_str} [{tracking_no}]: {content}")
+            elif tracking_no and content:
+                lines.append(f"\n• [{tracking_no}] {content}")
+            elif time_str and content:
+                lines.append(f"\n• {time_str}: {content}")
+            elif content:
+                lines.append(f"\n• {content}")
+        if len(tracks) > 5:
+            lines.append(f"\n• ... 仅显示最新5条（共{len(tracks)}条）")
+        return ''.join(lines)
+
+    def _format_order_info(self, order: dict, fba_code: str) -> str:
+        """格式化订单信息为文本"""
+        lines = [
+            f"📦 FBA编号: {fba_code}",
+        ]
+
+        # 品牌
+        brand = order.get('品牌', {})
+        if isinstance(brand, dict):
+            brand_name = brand.get('name', '')
+        else:
+            brand_name = brand
+        if brand_name:
+            lines.append(f"🏷️ 品牌: {brand_name}")
+
+        # 国家
+        country = order.get('国家', {})
+        if isinstance(country, dict):
+            country_name = country.get('name', '')
+        else:
+            country_name = country
+        if country_name:
+            lines.append(f"🌍 国家: {country_name}")
+
+        # 物流编号
+        wlbh = order.get('物流编号', '/')
+        if wlbh and wlbh != '/':
+            lines.append(f"📜 物流编号: {wlbh}")
+
+        # 出运渠道
+        channel = order.get('出运渠道', '/')
+        if channel and channel != '/':
+            lines.append(f"🚢 出运渠道: {channel}")
+
+        # 预计到港时间
+        eta = order.get('预计到港时间', '/')
+        if eta and eta != '/':
+            if isinstance(eta, int):
+                from datetime import datetime
+                eta_date = datetime.fromtimestamp(eta / 1000)
+                eta = eta_date.strftime('%Y-%m-%d')
+            lines.append(f"📅 预计到港: {eta}")
+
+        # 实际到港时间
+        actual_arrival = order.get('实际到港时间', '/')
+        if actual_arrival and actual_arrival != '/':
+            if isinstance(actual_arrival, int):
+                from datetime import datetime
+                actual_arrival_date = datetime.fromtimestamp(actual_arrival / 1000)
+                actual_arrival = actual_arrival_date.strftime('%Y-%m-%d')
+            lines.append(f"✅ 实际到港: {actual_arrival}")
+
+        # 货代公司
+        forwarder = order.get('货代公司', '/')
+        if forwarder and forwarder != '/':
+            lines.append(f"🏢 货代公司: {forwarder}")
+
+        # 发票号
+        invoice = order.get('发票号', '/')
+        if invoice and invoice != '/':
+            lines.append(f"🧾 发票号: {invoice}")
+
+        return '\n'.join(lines)
+
+    async def _query_tracking_info(self, order: dict, fba_code: str) -> str:
+        platform = decide_platform(order, 'auto')
+        tracking_no = get_primary_logistics_no(order)
+
+        if platform == 'none':
+            return ''
+
+        if platform in {'meitong', 'agl', 'baosen', 'qq', '17track'} and not tracking_no:
+            return '\n\n⚠️ 钉钉表格中缺少物流编号，暂时无法查询物流轨迹'
+
+        try:
+            if platform == 'meitong':
+                query_value = tracking_no
+                self.logger.info("轨迹查询: 平台=美通 物流编号=%s", query_value)
+                result = await self._run_tracking_query_with_retry(
+                    platform='美通',
+                    query_value=query_value,
+                    operation=lambda: query_meitong(query_value),
+                )
+            elif platform == 'agl':
+                query_value = tracking_no
+                self.logger.info("轨迹查询: 平台=AGL BookingID=%s", query_value)
+                result = await self._run_tracking_query_with_queue(
+                    platform='AGL',
+                    platform_key=platform,
+                    query_value=query_value,
+                    operation=lambda: asyncio.to_thread(query_agl, query_value, order, False),
+                )
+            elif platform == 'pingyi':
+                # 平谊直接使用用户发送的单号查询，不依赖钉钉表里的物流编号
+                query_value = fba_code
+                self.logger.info("轨迹查询: 平台=平谊 运单号=%s", query_value)
+                result = await self._run_tracking_query_with_queue(
+                    platform='平谊',
+                    platform_key=platform,
+                    query_value=query_value,
+                    operation=lambda: query_pingyi(query_value),
+                )
+            elif platform == 'baosen':
+                query_value = tracking_no
+                self.logger.info("轨迹查询: 平台=堡森 物流编号=%s", query_value)
+                result = await self._run_tracking_query_with_queue(
+                    platform='堡森',
+                    platform_key=platform,
+                    query_value=query_value,
+                    operation=lambda: query_baosen(query_value),
+                )
+            elif platform == 'qq':
+                query_value = tracking_no
+                self.logger.info("轨迹查询: 平台=QQ 物流编号=%s", query_value)
+                result = await self._run_qq_query_with_queue(
+                    platform='QQ',
+                    query_value=query_value,
+                    operation=lambda: asyncio.to_thread(query_qq, order, query_value),
+                )
+            elif platform == '17track':
+                query_value = tracking_no
+                self.logger.info("轨迹查询: 平台=17TRACK 物流编号=%s", query_value)
+                result = await self._run_tracking_query_with_queue(
+                    platform='17TRACK',
+                    platform_key=platform,
+                    query_value=query_value,
+                    operation=lambda: query_17track(query_value),
+                )
+            else:
+                return ''
+        except Exception as e:
+            self.logger.warning(f"查询物流轨迹失败: {e}")
+            return '\n\n⚠️ 物流轨迹查询失败'
+
+        return self._format_tracking_result(result, platform, query_value=query_value)
+
+    async def _run_tracking_query_with_queue(self, platform: str, platform_key: str, query_value: str, operation):
+        if platform_key not in _SERIAL_BROWSER_TRACKING_PLATFORMS:
+            return await self._run_tracking_query_with_retry(platform, query_value, operation)
+
+        queued_ahead = self._browser_queue_waiting
+        if self._browser_query_lock.locked():
+            self._browser_queue_waiting += 1
+            queued_ahead = self._browser_queue_waiting
+            self.logger.info(
+                "轨迹查询队列: 平台=%s 查询值=%s 排队中 queued_ahead=%s",
+                platform,
+                query_value,
+                queued_ahead,
+            )
+
+        await self._browser_query_lock.acquire()
+        if queued_ahead:
+            self._browser_queue_waiting = max(0, self._browser_queue_waiting - 1)
+
+        try:
+            self.logger.info(
+                "轨迹查询队列: 平台=%s 查询值=%s 开始执行 waiting=%s",
+                platform,
+                query_value,
+                self._browser_queue_waiting,
+            )
+            return await self._run_tracking_query_with_retry(platform, query_value, operation)
+        finally:
+            self._browser_query_lock.release()
+            self.logger.info(
+                "轨迹查询队列: 平台=%s 查询值=%s 执行结束 remaining_waiting=%s",
+                platform,
+                query_value,
+                self._browser_queue_waiting,
+            )
+
+    async def _run_qq_query_with_queue(self, platform: str, query_value: str, operation):
+        queued_ahead = self._qq_queue_waiting
+        if self._qq_query_lock.locked():
+            self._qq_queue_waiting += 1
+            queued_ahead = self._qq_queue_waiting
+            self.logger.info(
+                "QQ查询队列: 查询值=%s 排队中 queued_ahead=%s",
+                query_value,
+                queued_ahead,
+            )
+
+        await self._qq_query_lock.acquire()
+        if queued_ahead:
+            self._qq_queue_waiting = max(0, self._qq_queue_waiting - 1)
+
+        try:
+            self.logger.info(
+                "QQ查询队列: 查询值=%s 开始执行 waiting=%s",
+                query_value,
+                self._qq_queue_waiting,
+            )
+            return await self._run_tracking_query_with_retry(platform, query_value, operation)
+        finally:
+            self._qq_query_lock.release()
+            self.logger.info(
+                "QQ查询队列: 查询值=%s 执行结束 remaining_waiting=%s",
+                query_value,
+                self._qq_queue_waiting,
+            )
+
+    async def _run_tracking_query_with_retry(self, platform: str, query_value: str, operation):
+        last_error: Exception | None = None
+        last_result: dict | None = None
+
+        for attempt in range(1, _TRACK_QUERY_MAX_ATTEMPTS + 1):
+            try:
+                result = operation()
+                if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+                    result = await result
+
+                if self._should_retry_tracking_result(platform, result):
+                    error = str((result or {}).get('错误', '')).strip() or '未知错误'
+                    last_result = result
+                    self.logger.warning(
+                        "轨迹查询失败，准备重试: 平台=%s 查询值=%s attempt=%s/%s 错误=%s",
+                        platform,
+                        query_value,
+                        attempt,
+                        _TRACK_QUERY_MAX_ATTEMPTS,
+                        error,
+                    )
+                    if attempt < _TRACK_QUERY_MAX_ATTEMPTS:
+                        await asyncio.sleep(_TRACK_QUERY_RETRY_DELAY_SECONDS)
+                        continue
+                return result
+            except Exception as exc:
+                last_error = exc
+                if isinstance(exc, BaosenLoginError):
+                    self.logger.warning(
+                        "轨迹查询遇到不可重试错误: 平台=%s 查询值=%s 错误=%s",
+                        platform,
+                        query_value,
+                        exc,
+                    )
+                    raise
+                self.logger.warning(
+                    "轨迹查询异常，准备重试: 平台=%s 查询值=%s attempt=%s/%s 错误=%s",
+                    platform,
+                    query_value,
+                    attempt,
+                    _TRACK_QUERY_MAX_ATTEMPTS,
+                    exc,
+                )
+                if attempt < _TRACK_QUERY_MAX_ATTEMPTS:
+                    await asyncio.sleep(_TRACK_QUERY_RETRY_DELAY_SECONDS)
+                    continue
+                raise
+
+        if last_result is not None:
+            return last_result
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f'轨迹查询失败: 平台={platform} 查询值={query_value}')
+
+    def _should_retry_tracking_result(self, platform: str, result: dict | None) -> bool:
+        if not isinstance(result, dict):
+            return False
+        error = str(result.get('错误', '') or '').strip()
+        if not error:
+            return False
+        if result.get('物流轨迹'):
+            return False
+        normalized_platform = str(platform or '').strip().upper()
+        if normalized_platform == 'QQ':
+            non_retryable_markers = (
+                '等待 QQ 回复超时',
+                'token verify failed',
+                'QQ API HTTP 异常: status=403',
+                'action=send_group_msg error=Timeout',
+                'NodeIKernelMsgService/sendMsg',
+                '未找到目标QQ群',
+                '中未找到成员',
+                '存在多个同名成员',
+                '当前货代公司未配置 QQ 查询规则',
+            )
+            if any(marker in error for marker in non_retryable_markers):
+                return False
+        return True
 
 
-def parse_json(value: str) -> Any:
+def main():
+    """主函数"""
+    # 加载环境变量
+    env_path = Path(__file__).with_name('.env')
+    load_dotenv(env_path)
+
+    logger.info("=" * 50)
+    logger.info("钉钉物流查询机器人启动中...")
+    logger.info("=" * 50)
+
+    # 获取凭证
+    from logistics_query import get_env
     try:
-        return json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"invalid JSON: {exc}") from exc
+        client_id = get_env('DINGTALK_APP_KEY')
+        client_secret = get_env('DINGTALK_APP_SECRET')
+    except ValueError as e:
+        logger.error(f"❌ {e}")
+        logger.error("请在 .env 文件中配置 DINGTALK_APP_KEY 和 DINGTALK_APP_SECRET")
+        sys.exit(1)
 
+    logger.info(f"📱 Client ID: {client_id[:10]}...")
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Use DingTalk AI Table APIs from Python.")
-    parser.add_argument("--app-key", default=os.getenv("DINGTALK_APP_KEY"))
-    parser.add_argument("--app-secret", default=os.getenv("DINGTALK_APP_SECRET"))
-    parser.add_argument("--base-id", default=os.getenv("DINGTALK_BASE_ID"))
-    default_sheet_id = os.getenv("DINGTALK_SHEET_ID")
-    parser.add_argument("--sheet-id", default=default_sheet_id)
+    # 预加载表格数据
+    try:
+        load_env()
+        logger.info("✅ 环境变量加载成功")
+    except Exception as e:
+        logger.warning(f"⚠️ 环境变量加载失败: {e}")
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # 创建钉钉Stream客户端
+    credential = dingtalk_stream.Credential(client_id, client_secret)
+    client = dingtalk_stream.DingTalkStreamClient(credential)
 
-    subparsers.add_parser("list-sheets")
-
-    create_sheet = subparsers.add_parser("create-sheet")
-    create_sheet.add_argument("--name", required=True)
-
-    get_sheet = subparsers.add_parser("get-sheet")
-    get_sheet.add_argument("--sheet-id", default=default_sheet_id)
-
-    list_records = subparsers.add_parser("list-records")
-    list_records.add_argument("--sheet-id", default=default_sheet_id)
-    list_records.add_argument("--max-results", type=int, default=100)
-    list_records.add_argument("--next-token")
-
-    get_record = subparsers.add_parser("get-record")
-    get_record.add_argument("--sheet-id", default=default_sheet_id)
-    get_record.add_argument("--record-id", required=True)
-
-    insert_records = subparsers.add_parser("insert-records")
-    insert_records.add_argument("--sheet-id", default=default_sheet_id)
-    insert_records.add_argument(
-        "--records-json",
-        required=True,
-        help='Example: \'[{"Name":"Alice","Score":95}]\'',
+    # 注册消息处理器
+    logger.info("📝 注册消息处理器...")
+    client.register_callback_handler(
+        dingtalk_stream.chatbot.ChatbotMessage.TOPIC,
+        LogisticsBotHandler()
     )
 
-    update_records = subparsers.add_parser("update-records")
-    update_records.add_argument("--sheet-id", default=default_sheet_id)
-    update_records.add_argument(
-        "--records-json",
-        required=True,
-        help='Example: \'[{"id":"recxxx","fields":{"Score":100}}]\'',
-    )
+    logger.info("✅ 钉钉机器人启动成功！")
+    logger.info("💡 发送FBA编号进行查询...")
 
-    delete_records = subparsers.add_parser("delete-records")
-    delete_records.add_argument("--sheet-id", default=default_sheet_id)
-    delete_records.add_argument(
-        "--record-ids-json",
-        required=True,
-        help='Example: \'["recxxx","recyyy"]\'',
-    )
-
-    return parser
+    # 启动客户端
+    try:
+        client.start_forever()
+    except KeyboardInterrupt:
+        logger.info("\n⏹️  收到停止信号，正在关闭...")
+    except Exception as e:
+        logger.error(f"❌ 运行时发生错误: {e}", exc_info=True)
+        sys.exit(1)
 
 
-def required(value: str | None, name: str) -> str:
-    if value:
-        return value
-    raise SystemExit(f"missing required argument or env var: {name}")
-
-
-def get_sheet_id(args: argparse.Namespace) -> str:
-    return required(getattr(args, "sheet_id", None), "DINGTALK_SHEET_ID / --sheet-id")
-
-
-def main() -> None:
-    load_env_file()
-    parser = build_parser()
-    args = parser.parse_args()
-
-    app_key = required(args.app_key, "DINGTALK_APP_KEY / --app-key")
-    app_secret = required(args.app_secret, "DINGTALK_APP_SECRET / --app-secret")
-    base_id = required(args.base_id, "DINGTALK_BASE_ID / --base-id")
-
-    access_token = get_access_token(app_key, app_secret)
-    ai_table = AITableClient(access_token, base_id)
-
-    if args.command == "list-sheets":
-        result = ai_table.list_sheets()
-    elif args.command == "create-sheet":
-        result = ai_table.create_sheet(args.name)
-    elif args.command == "get-sheet":
-        sheet_id = get_sheet_id(args)
-        result = ai_table.get_sheet(sheet_id)
-    elif args.command == "list-records":
-        sheet_id = get_sheet_id(args)
-        result = ai_table.list_records(sheet_id, args.max_results, args.next_token)
-    elif args.command == "get-record":
-        sheet_id = get_sheet_id(args)
-        result = ai_table.get_record(sheet_id, args.record_id)
-    elif args.command == "insert-records":
-        sheet_id = get_sheet_id(args)
-        records = parse_json(args.records_json)
-        result = ai_table.insert_records(sheet_id, records)
-    elif args.command == "update-records":
-        sheet_id = get_sheet_id(args)
-        records = parse_json(args.records_json)
-        result = ai_table.update_records(sheet_id, records)
-    elif args.command == "delete-records":
-        sheet_id = get_sheet_id(args)
-        record_ids = parse_json(args.record_ids_json)
-        result = ai_table.delete_records(sheet_id, record_ids)
-    else:
-        raise SystemExit(f"unsupported command: {args.command}")
-
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
