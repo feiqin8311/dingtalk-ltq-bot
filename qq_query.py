@@ -34,6 +34,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 DEFAULT_HISTORY_FETCH_COUNT = 50
 DEFAULT_HISTORY_LOOKBACK_COUNT = 5000
 DEFAULT_HISTORY_CONTEXT_WINDOW = 20
+DEFAULT_HISTORY_FRESHNESS_DAYS = 7
 _TRACKING_NUMBER_RE = re.compile(r'(?<!\w)[A-Za-z0-9](?:[A-Za-z0-9.-]{6,}[A-Za-z0-9])?(?!\w)')
 _NON_LOGISTICS_NOTICE_KEYWORDS = (
     '关税',
@@ -443,6 +444,13 @@ def _message_sort_key(message: dict[str, Any]) -> tuple[int, int]:
     return int(message.get('time') or 0), int(message.get('message_seq') or 0)
 
 
+def _is_message_older_than(message: dict[str, Any], now_ts: int, max_age_seconds: int) -> bool:
+    message_ts = int(message.get('time') or 0)
+    if message_ts <= 0:
+        return False
+    return now_ts - message_ts > max(max_age_seconds, 0)
+
+
 def _message_contains_tracking_no(message: dict[str, Any], tracking_no: str) -> bool:
     needle = clean_text(tracking_no).lower()
     if not needle:
@@ -679,7 +687,7 @@ def _find_reply_messages(
     return collected
 
 
-def query_qq(order: dict[str, Any], tracking_no: str) -> dict[str, Any]:
+def query_qq(order: dict[str, Any], tracking_no: str, defer_if_stale: bool = False) -> dict[str, Any]:
     route_rule = get_qq_route_rule(order)
     if route_rule is None:
         return {
@@ -781,7 +789,16 @@ def query_qq(order: dict[str, Any], tracking_no: str) -> dict[str, Any]:
                 history_tracks[0].get('时间'),
                 history_tracks[0].get('内容'),
             )
-        if history_tracks:
+        latest_history_message = history_matches[0] if history_matches else None
+        history_is_stale = bool(
+            latest_history_message
+            and _is_message_older_than(
+                latest_history_message,
+                now_ts=int(time.time()),
+                max_age_seconds=DEFAULT_HISTORY_FRESHNESS_DAYS * 24 * 60 * 60,
+            )
+        )
+        if history_tracks and not history_is_stale:
             return {
                 '平台': 'QQ',
                 '查询值': tracking_no,
@@ -796,6 +813,26 @@ def query_qq(order: dict[str, Any], tracking_no: str) -> dict[str, Any]:
                 '物流轨迹': history_tracks,
                 '最新轨迹': history_tracks[0],
             }
+        if history_tracks and history_is_stale:
+            logger.info(
+                "QQ历史已过期: tracking=%s 最新时间=%s 超过%s天，转为主动询问",
+                tracking_no,
+                history_tracks[0].get('时间'),
+                DEFAULT_HISTORY_FRESHNESS_DAYS,
+            )
+            if defer_if_stale:
+                return {
+                    '平台': 'QQ',
+                    '查询值': tracking_no,
+                    '群名': route_rule.group_name,
+                    '群号': str(group_id),
+                    '询问对象': display_name,
+                    '询问对象QQ': str(user_id),
+                    '结果来源': '群历史已过期，转为异步人工询问',
+                    '需要异步跟进': True,
+                    '物流轨迹': history_tracks,
+                    '最新轨迹': history_tracks[0],
+                }
 
         baseline_history = client.get_group_msg_history(group_id, history_fetch_count)
         baseline_message_seq = max((int(item.get('message_seq') or 0) for item in baseline_history), default=0)

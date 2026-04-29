@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import qq_query
 
@@ -15,6 +16,25 @@ class _FakeHistoryClient:
         if not self.paged_pages:
             return []
         return self.paged_pages.pop(0)[:count]
+
+
+class _FakeQueryClient:
+    def __init__(self, history_pages=None, send_result=None):
+        self.history_pages = list(history_pages or [])
+        self.send_result = send_result or {"message_id": "sent-1"}
+        self.sent_messages = []
+
+    def get_group_msg_history(self, group_id, count):
+        if self.history_pages:
+            return self.history_pages.pop(0)[:count]
+        return []
+
+    def get_group_msg_history_with_seq(self, group_id, message_seq, count, reverse_order=True):
+        return []
+
+    def send_group_msg(self, group_id, user_id, tracking_no):
+        self.sent_messages.append((group_id, user_id, tracking_no))
+        return dict(self.send_result)
 
 
 class QQTrackExpansionTests(unittest.TestCase):
@@ -137,6 +157,107 @@ class QQTrackExpansionTests(unittest.TestCase):
         messages = qq_query._scan_history_messages(client, 1, page_size=20, max_messages=50)
 
         self.assertIn("m81", [item["message_id"] for item in messages])
+
+    def test_query_qq_returns_recent_history_without_sending_message(self):
+        now_ts = 1_800_000_000
+        recent_message = {
+            "message_id": "m1",
+            "message_seq": "100",
+            "time": now_ts - 3 * 24 * 60 * 60,
+            "sender": {"user_id": "3001065660"},
+            "raw_message": "KMFTORY2600585 已离港",
+            "message": [{"type": "text", "data": {"text": "KMFTORY2600585 已离港"}}],
+        }
+        client = _FakeQueryClient(history_pages=[[recent_message]])
+
+        with (
+            mock.patch.object(qq_query, "NapCatOneBotClient", return_value=client),
+            mock.patch.object(qq_query, "_resolve_group_id", return_value=123456),
+            mock.patch.object(qq_query, "_resolve_user", return_value=(3001065660, "李美慧")),
+            mock.patch.object(
+                qq_query,
+                "get_qq_api_settings",
+                return_value=("http://127.0.0.1:6702", "", 15, 30, 0.01, 50),
+            ),
+            mock.patch.object(qq_query, "get_qq_history_lookback_count", return_value=50),
+            mock.patch.object(qq_query.time, "time", return_value=now_ts),
+        ):
+            result = qq_query.query_qq({"货代公司": "金为"}, "KMFTORY2600585")
+
+        self.assertEqual(result["结果来源"], "群历史(按物流编号匹配，展开消息中的多单号)")
+        self.assertEqual(client.sent_messages, [])
+
+    def test_query_qq_sends_message_when_latest_history_is_older_than_seven_days(self):
+        now_ts = 1_800_000_000
+        stale_message = {
+            "message_id": "m1",
+            "message_seq": "100",
+            "time": now_ts - 8 * 24 * 60 * 60,
+            "sender": {"user_id": "3001065660"},
+            "raw_message": "KMFTORY2600585 已离港",
+            "message": [{"type": "text", "data": {"text": "KMFTORY2600585 已离港"}}],
+        }
+        fresh_reply = {
+            "message_id": "m2",
+            "message_seq": "101",
+            "time": now_ts,
+            "user_id": "3001065660",
+            "sender": {"user_id": "3001065660"},
+            "raw_message": "KMFTORY2600585 已到港",
+            "message": [{"type": "text", "data": {"text": "KMFTORY2600585 已到港"}}],
+        }
+        client = _FakeQueryClient(history_pages=[[stale_message], [stale_message], [stale_message, fresh_reply]])
+
+        with (
+            mock.patch.object(qq_query, "NapCatOneBotClient", return_value=client),
+            mock.patch.object(qq_query, "_resolve_group_id", return_value=123456),
+            mock.patch.object(qq_query, "_resolve_user", return_value=(3001065660, "李美慧")),
+            mock.patch.object(
+                qq_query,
+                "get_qq_api_settings",
+                return_value=("http://127.0.0.1:6702", "", 15, 30, 0.01, 50),
+            ),
+            mock.patch.object(qq_query, "get_qq_history_lookback_count", return_value=50),
+            mock.patch.object(qq_query.time, "time", side_effect=[now_ts, now_ts, now_ts, now_ts + 1, now_ts + 1]),
+            mock.patch.object(qq_query.time, "sleep", return_value=None),
+        ):
+            result = qq_query.query_qq({"货代公司": "金为"}, "KMFTORY2600585")
+
+        self.assertEqual(client.sent_messages, [(123456, 3001065660, "KMFTORY2600585")])
+        self.assertEqual(result["最新轨迹"]["内容"], "KMFTORY2600585 已到港")
+
+    def test_query_qq_defers_stale_history_without_sending_message_when_requested(self):
+        now_ts = 1_800_000_000
+        stale_message = {
+            "message_id": "m1",
+            "message_seq": "100",
+            "time": now_ts - 8 * 24 * 60 * 60,
+            "sender": {"user_id": "3001065660"},
+            "raw_message": "KMFTORY2600585 已离港",
+            "message": [{"type": "text", "data": {"text": "KMFTORY2600585 已离港"}}],
+        }
+        client = _FakeQueryClient(history_pages=[[stale_message]])
+
+        with (
+            mock.patch.object(qq_query, "NapCatOneBotClient", return_value=client),
+            mock.patch.object(qq_query, "_resolve_group_id", return_value=123456),
+            mock.patch.object(qq_query, "_resolve_user", return_value=(3001065660, "李美慧")),
+            mock.patch.object(
+                qq_query,
+                "get_qq_api_settings",
+                return_value=("http://127.0.0.1:6702", "", 15, 30, 0.01, 50),
+            ),
+            mock.patch.object(qq_query, "get_qq_history_lookback_count", return_value=50),
+            mock.patch.object(qq_query.time, "time", return_value=now_ts),
+        ):
+            result = qq_query.query_qq(
+                {"货代公司": "金为"},
+                "KMFTORY2600585",
+                defer_if_stale=True,
+            )
+
+        self.assertTrue(result["需要异步跟进"])
+        self.assertEqual(client.sent_messages, [])
 
 
 if __name__ == "__main__":

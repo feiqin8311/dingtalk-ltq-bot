@@ -293,9 +293,14 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                 reply_text = self._format_order_info(order, fba_code)
                 platform = decide_platform(order, 'auto')
                 if platform == 'qq':
-                    reply_text += self._build_qq_pending_reply(order)
-                    self.reply_text(reply_text, incoming_message)
-                    self._schedule_qq_follow_up(incoming_message, order, fba_code)
+                    qq_result = await self._query_qq_preview(order, fba_code)
+                    if qq_result.get('需要异步跟进'):
+                        reply_text += self._build_qq_pending_reply(order)
+                        self.reply_text(reply_text, incoming_message)
+                        self._schedule_qq_follow_up(incoming_message, order, fba_code)
+                    else:
+                        reply_text += self._format_tracking_result(qq_result, 'qq')
+                        self.reply_text(reply_text, incoming_message)
                     self.logger.info("查询完成 FBA=%s", fba_code)
                     return
 
@@ -317,6 +322,23 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         return (
             f"\n\n⏳ 已发起 QQ 人工查询({tracking_no})"
             "\n💬 该查询依赖人工回复，结果会在收到回复后单独补发"
+        )
+
+    async def _query_qq_preview(self, order: dict, fba_code: str) -> dict:
+        tracking_no = get_primary_logistics_no(order)
+        if not tracking_no:
+            return {
+                '平台': 'QQ',
+                '查询值': '',
+                '物流轨迹': [],
+                '最新轨迹': {},
+                '错误': '钉钉表格中缺少物流编号，暂时无法查询物流轨迹',
+            }
+        self.logger.info("轨迹查询预判: 平台=QQ 物流编号=%s", tracking_no)
+        return await self._run_qq_query_with_queue(
+            platform='QQ',
+            query_value=tracking_no,
+            operation=lambda: asyncio.to_thread(query_qq, order, tracking_no, True),
         )
 
     def _schedule_qq_follow_up(self, incoming_message, order: dict, fba_code: str) -> None:
@@ -352,6 +374,9 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
 
     def _reply_qq_result(self, incoming_message, fba_code: str, result: dict) -> None:
         tracking_info = self._format_tracking_result(result, 'qq')
+        if not tracking_info:
+            self.logger.info("QQ 异步回推跳过空结果 FBA=%s", fba_code)
+            return
         reply_text = f"📦 FBA编号: {fba_code}{tracking_info}"
         self.reply_text(reply_text, incoming_message)
 
