@@ -49,7 +49,7 @@ def _install_fake_dotenv():
 
 
 class TrackingFormatTests(unittest.TestCase):
-    def test_qq_tracking_result_includes_tracking_number_labels(self):
+    def test_qq_tracking_result_includes_tracking_number_label(self):
         fake_stream = _install_fake_dingtalk_stream()
         fake_dotenv = _install_fake_dotenv()
         with mock.patch.dict(
@@ -91,7 +91,53 @@ class TrackingFormatTests(unittest.TestCase):
         )
 
         self.assertIn("[KMFTORY2600585]", text)
-        self.assertIn("[KMFTORY2600604]", text)
+        self.assertNotIn("[KMFTORY2600604]", text)
+
+    def test_qq_tracking_result_deduplicates_expanded_history_entries(self):
+        fake_stream = _install_fake_dingtalk_stream()
+        fake_dotenv = _install_fake_dotenv()
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "dingtalk_stream": fake_stream,
+                "dingtalk_stream.utils": fake_stream.utils,
+                "dotenv": fake_dotenv,
+            },
+        ):
+            if "main" in sys.modules:
+                del sys.modules["main"]
+            import main
+
+        handler = main.LogisticsBotHandler()
+        text = handler._format_tracking_result(
+            {
+                "平台": "QQ",
+                "查询值": "KMFTORY2600585",
+                "结果来源": "群历史(按物流编号匹配，展开消息中的多单号)",
+                "物流轨迹": [
+                    {
+                        "时间": "2026-04-07 12:00:00",
+                        "内容": "船舶SM SEOUL V.2603E 4-4已离港，预计4-27到港(TORONTO)",
+                        "单号": "KMFTORY2600585",
+                    },
+                    {
+                        "时间": "2026-04-07 12:00:00",
+                        "内容": "船舶SM SEOUL V.2603E 4-4已离港，预计4-27到港(TORONTO)",
+                        "单号": "KMFTORY2600604",
+                    },
+                ],
+                "最新轨迹": {
+                    "时间": "2026-04-07 12:00:00",
+                    "内容": "船舶SM SEOUL V.2603E 4-4已离港，预计4-27到港(TORONTO)",
+                    "单号": "KMFTORY2600585",
+                },
+            },
+            "qq",
+        )
+
+        self.assertEqual(text.count("• "), 1)
+        self.assertIn("[KMFTORY2600585]", text)
+        self.assertNotIn("[KMFTORY2600604]", text)
 
 
 if __name__ == "__main__":

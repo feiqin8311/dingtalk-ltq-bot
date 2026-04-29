@@ -119,6 +119,24 @@ def _normalize_track_content(track: dict) -> dict:
     return normalized
 
 
+def _deduplicate_tracks(tracks: list[dict]) -> list[dict]:
+    deduplicated: list[dict] = []
+    seen_signatures: set[tuple[str, str, str]] = set()
+
+    for track in tracks:
+        signature = (
+            str(track.get('时间', '') or '').strip(),
+            str(track.get('内容', '') or track.get('地点', '') or '').strip(),
+            str(track.get('消息类型', '') or '').strip(),
+        )
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        deduplicated.append(track)
+
+    return deduplicated
+
+
 def _extract_wechat_query_value(message_content: str) -> str:
     compact = (message_content or '').strip()
     if '微信' not in compact:
@@ -489,7 +507,9 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
     def _format_tracking_result(self, result: dict, platform: str, query_value: str | None = None) -> str:
         normalized_platform = str(result.get('平台', platform) or platform).strip()
         display_query_value = (query_value or result.get('查询值') or '').strip()
-        tracks = [_normalize_track_content(track) for track in _sort_tracks_newest_first(result.get('物流轨迹') or [])]
+        tracks = _deduplicate_tracks(
+            [_normalize_track_content(track) for track in _sort_tracks_newest_first(result.get('物流轨迹') or [])]
+        )
 
         if not tracks:
             error = str(result.get('错误', '') or '').strip()
