@@ -120,12 +120,24 @@ class _FakeContext:
     def __init__(self, pages=None):
         self.pages = list(pages or [])
         self.new_page_calls = 0
+        self.close_calls = 0
+        self.clear_cookies_calls = 0
+        self.init_scripts = []
 
     def new_page(self):
         self.new_page_calls += 1
         page = _FakePage(url="about:blank")
         self.pages.append(page)
         return page
+
+    def close(self):
+        self.close_calls += 1
+
+    def clear_cookies(self):
+        self.clear_cookies_calls += 1
+
+    def add_init_script(self, script):
+        self.init_scripts.append(script)
 
 
 class _FakeBrowserWithContexts:
@@ -305,10 +317,10 @@ class QueryAglTests(unittest.TestCase):
         self.assertEqual(tracks[0]["内容"], "Space confirmed")
         self.assertEqual(page.wait_for_timeout_calls, [200, 200])
 
-    def test_create_agl_page_uses_new_page_even_when_context_has_existing_pages(self):
+    def test_create_agl_page_reuses_existing_context_and_clears_cookies(self):
         old_page = _FakePage(url="https://example.com/old")
-        context = _FakeContext(pages=[old_page])
-        browser = _FakeBrowserWithContexts(contexts=[context])
+        existing_context = _FakeContext(pages=[old_page])
+        browser = _FakeBrowserWithContexts(contexts=[existing_context])
         playwright = _FakePlaywrightRoot(browser)
 
         with mock.patch.object(logistics_query, "get_local_cdp_endpoint", return_value="ws://fake-cdp"):
@@ -319,9 +331,13 @@ class QueryAglTests(unittest.TestCase):
             )
 
         self.assertIs(created_browser, browser)
-        self.assertIs(created_context, context)
+        self.assertIs(created_context, existing_context)
+        self.assertEqual(browser.new_context_calls, 0)
+        self.assertEqual(created_context.clear_cookies_calls, 1)
+        self.assertEqual(len(created_context.init_scripts), 1)
+        self.assertIn("navigator.credentials", created_context.init_scripts[0])
         self.assertIsNot(page, old_page)
-        self.assertEqual(context.new_page_calls, 1)
+        self.assertEqual(created_context.new_page_calls, 1)
         self.assertEqual(page.bring_to_front_calls, 1)
         self.assertEqual(playwright.chromium.endpoint, "ws://fake-cdp")
         cleanup()

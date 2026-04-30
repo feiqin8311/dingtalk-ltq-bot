@@ -648,6 +648,41 @@ def create_agl_page(playwright, credential_source: str, headless: bool):
         locale='zh-CN',
         timezone_id='Asia/Shanghai',
     )
+    try:
+        context.clear_cookies()
+    except Exception:
+        pass
+    try:
+        context.add_init_script(
+            """
+            (() => {
+              const credentials = navigator.credentials;
+              if (!credentials) {
+                return;
+              }
+              const originalGet = credentials.get ? credentials.get.bind(credentials) : null;
+              const originalCreate = credentials.create ? credentials.create.bind(credentials) : null;
+              if (originalGet) {
+                credentials.get = (options) => {
+                  if (options && options.publicKey) {
+                    return Promise.reject(new DOMException('Passkey disabled by automation', 'NotSupportedError'));
+                  }
+                  return originalGet(options);
+                };
+              }
+              if (originalCreate) {
+                credentials.create = (options) => {
+                  if (options && options.publicKey) {
+                    return Promise.reject(new DOMException('Passkey disabled by automation', 'NotSupportedError'));
+                  }
+                  return originalCreate(options);
+                };
+              }
+            })();
+            """
+        )
+    except Exception:
+        pass
     _ = credential_source, headless
     page = context.new_page()
     try:
