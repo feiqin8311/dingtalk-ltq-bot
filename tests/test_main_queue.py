@@ -200,7 +200,7 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("最新物流轨迹(QQ)", replies[1])
         schedule_mock.assert_not_called()
 
-    async def test_handle_text_message_schedules_async_follow_up_for_stale_qq_history(self):
+    async def test_handle_text_message_returns_stale_qq_history_and_sends_question(self):
         handler, main = self._make_handler()
         replies: list[str] = []
         handler.reply_text = lambda text, incoming_message: replies.append(text)
@@ -209,7 +209,10 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
         qq_result = {
             "平台": "QQ",
             "查询值": "KMFTORY2600585",
-            "需要异步跟进": True,
+            "结果来源": "群历史已超过7天，已重新发起QQ人工询问",
+            "需要QQ询问": True,
+            "物流轨迹": [{"时间": "2026-04-07 11:18:50", "内容": "KMFTORY2600585 已离港"}],
+            "最新轨迹": {"时间": "2026-04-07 11:18:50", "内容": "KMFTORY2600585 已离港"},
         }
 
         with (
@@ -217,13 +220,16 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "decide_platform", return_value="qq"),
             patch.object(handler, "_format_order_info", return_value="📦 FBA编号: FBA19900H9WP"),
             patch.object(handler, "_query_qq_preview", return_value=qq_result),
-            patch.object(handler, "_schedule_qq_follow_up") as schedule_mock,
+            patch.object(handler, "_schedule_qq_follow_up") as follow_up_mock,
+            patch.object(handler, "_schedule_qq_question", create=True) as question_mock,
         ):
             await handler._handle_text_message(self._make_message(), "FBA19900H9WP")
 
         self.assertEqual(len(replies), 2)
-        self.assertIn("已发起 QQ 人工查询(KMFTORY2600585)", replies[1])
-        schedule_mock.assert_called_once()
+        self.assertIn("最新物流轨迹(QQ)", replies[1])
+        self.assertNotIn("结果会在收到回复后单独补发", replies[1])
+        follow_up_mock.assert_not_called()
+        question_mock.assert_called_once()
 
 
 if __name__ == "__main__":

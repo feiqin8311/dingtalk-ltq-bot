@@ -687,6 +687,66 @@ def _find_reply_messages(
     return collected
 
 
+def send_qq_question(order: dict[str, Any], tracking_no: str) -> dict[str, Any]:
+    route_rule = get_qq_route_rule(order)
+    if route_rule is None:
+        return {
+            '平台': 'QQ',
+            '查询值': tracking_no,
+            '错误': '当前货代公司未配置 QQ 查询规则',
+        }
+
+    if not tracking_no:
+        return {
+            '平台': 'QQ',
+            '查询值': tracking_no,
+            '群名': route_rule.group_name,
+            '询问对象': route_rule.mention_name,
+            '错误': '钉钉表格中未找到物流编号，无法通过 QQ 询问物流状态',
+        }
+
+    question_text = build_question_text(route_rule, tracking_no)
+    (
+        api_base_url,
+        api_token,
+        api_timeout_seconds,
+        _reply_timeout_seconds,
+        _poll_interval_seconds,
+        _history_fetch_count,
+    ) = get_qq_api_settings()
+    client = NapCatOneBotClient(
+        base_url=api_base_url,
+        token=api_token,
+        timeout_seconds=api_timeout_seconds,
+    )
+
+    try:
+        group_id = _resolve_group_id(client, route_rule)
+        user_id, display_name = _resolve_user(client, route_rule, group_id)
+        send_result = client.send_group_msg(group_id, user_id, tracking_no)
+        sent_message_id = send_result.get('message_id', '')
+        return {
+            '平台': 'QQ',
+            '查询值': tracking_no,
+            '群名': route_rule.group_name,
+            '群号': str(group_id),
+            '询问对象': display_name,
+            '询问对象QQ': str(user_id),
+            '提问内容': question_text,
+            '发送消息ID': str(sent_message_id),
+        }
+    except Exception as exc:
+        logger.warning("QQ 询问发送失败: tracking_no=%s error=%s", tracking_no, exc)
+        return {
+            '平台': 'QQ',
+            '查询值': tracking_no,
+            '群名': route_rule.group_name,
+            '询问对象': route_rule.mention_name,
+            '提问内容': question_text,
+            '错误': str(exc),
+        }
+
+
 def query_qq(order: dict[str, Any], tracking_no: str, defer_if_stale: bool = False) -> dict[str, Any]:
     route_rule = get_qq_route_rule(order)
     if route_rule is None:
@@ -828,11 +888,29 @@ def query_qq(order: dict[str, Any], tracking_no: str, defer_if_stale: bool = Fal
                     '群号': str(group_id),
                     '询问对象': display_name,
                     '询问对象QQ': str(user_id),
-                    '结果来源': '群历史已过期，转为异步人工询问',
-                    '需要异步跟进': True,
+                    '提问内容': question_text,
+                    '发送消息ID': '',
+                    '回复消息ID': str(history_matches[0].get('message_id') or ''),
+                    '结果来源': '群历史已超过7天，已重新发起QQ人工询问',
+                    '需要QQ询问': True,
                     '物流轨迹': history_tracks,
                     '最新轨迹': history_tracks[0],
                 }
+        if defer_if_stale:
+            return {
+                '平台': 'QQ',
+                '查询值': tracking_no,
+                '群名': route_rule.group_name,
+                '群号': str(group_id),
+                '询问对象': display_name,
+                '询问对象QQ': str(user_id),
+                '提问内容': question_text,
+                '发送消息ID': '',
+                '结果来源': '群历史无7天内李美慧消息，已重新发起QQ人工询问',
+                '需要QQ询问': True,
+                '物流轨迹': history_tracks,
+                '最新轨迹': history_tracks[0] if history_tracks else {},
+            }
 
         baseline_history = client.get_group_msg_history(group_id, history_fetch_count)
         baseline_message_seq = max((int(item.get('message_seq') or 0) for item in baseline_history), default=0)

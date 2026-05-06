@@ -30,7 +30,7 @@ from logistics_query import (
     get_primary_logistics_no,
     get_dingtalk_access_token,
 )
-from qq_query import query_qq
+from qq_query import query_qq, send_qq_question
 from wechat_query import get_wechat_provider, query_wechat
 from pathlib import Path
 from dingtalk_stream.utils import DINGTALK_OPENAPI_ENDPOINT
@@ -294,7 +294,11 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                 platform = decide_platform(order, 'auto')
                 if platform == 'qq':
                     qq_result = await self._query_qq_preview(order, fba_code)
-                    if qq_result.get('需要异步跟进'):
+                    if qq_result.get('需要QQ询问'):
+                        reply_text += self._format_tracking_result(qq_result, 'qq')
+                        self.reply_text(reply_text, incoming_message)
+                        self._schedule_qq_question(order, fba_code)
+                    elif qq_result.get('需要异步跟进'):
                         reply_text += self._build_qq_pending_reply(order)
                         self.reply_text(reply_text, incoming_message)
                         self._schedule_qq_follow_up(incoming_message, order, fba_code)
@@ -345,6 +349,30 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         task = asyncio.create_task(self._run_qq_follow_up(incoming_message, order, fba_code))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def _schedule_qq_question(self, order: dict, fba_code: str) -> None:
+        task = asyncio.create_task(self._run_qq_question(order, fba_code))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_qq_question(self, order: dict, fba_code: str) -> None:
+        tracking_no = get_primary_logistics_no(order)
+        if not tracking_no:
+            self.logger.info("QQ 人工询问跳过: FBA=%s 缺少物流编号", fba_code)
+            return
+        try:
+            result = await self._run_qq_query_with_queue(
+                platform='QQ',
+                query_value=tracking_no,
+                operation=lambda: asyncio.to_thread(send_qq_question, order, tracking_no),
+            )
+            error = str(result.get('错误', '') or '').strip()
+            if error:
+                self.logger.warning("QQ 人工询问发送失败 FBA=%s error=%s", fba_code, error)
+                return
+            self.logger.info("QQ 人工询问已发送 FBA=%s message_id=%s", fba_code, result.get('发送消息ID', ''))
+        except Exception as e:
+            self.logger.error("QQ 人工询问发送异常 FBA=%s error=%s", fba_code, e, exc_info=True)
 
     async def _run_qq_follow_up(self, incoming_message, order: dict, fba_code: str) -> None:
         try:
