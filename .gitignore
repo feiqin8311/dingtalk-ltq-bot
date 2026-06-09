@@ -12,6 +12,7 @@ __pycache__/
 *.db-shm
 *.db-wal
 .tmp_ai_web_explorer/
+.worktrees/
 data/
 runtime/
 tmp/
