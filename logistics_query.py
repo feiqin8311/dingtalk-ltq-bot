@@ -90,6 +90,10 @@ def clean_text(value: Any) -> str:
     return ' '.join(str(value).split()).strip()
 
 
+def normalize_tracking_number(value: Any) -> str:
+    return clean_text(value).replace(' ', '').upper()
+
+
 def parse_track_time(value: str) -> datetime | None:
     text = (value or '').strip()
     if not text:
@@ -2138,6 +2142,27 @@ def decide_platform(order: dict[str, Any] | None, explicit_platform: str) -> str
     if carrier == '大黄蜂':
         return '17track'
     return 'meitong'
+
+
+def decide_tracking_platform(tracking_no: str) -> str:
+    normalized = normalize_tracking_number(tracking_no)
+    if normalized.startswith('UUS'):
+        return 'uniuni'
+    if normalized.startswith('GFUS'):
+        return 'gofo'
+    if normalized.startswith('9'):
+        return 'usps'
+    if normalized.startswith('1Z0'):
+        return 'ups'
+    if normalized.startswith('H00RVA') or normalized.startswith('GV'):
+        return 'yuntrack'
+    if normalized.startswith('UK'):
+        return 'amazon_uk'
+    if normalized.startswith(('TBC', 'INTL', 'BNI')):
+        return 'swiship_ca'
+    if normalized.startswith('TBA'):
+        return 'amazon_us'
+    return '17track_en'
 
 
 def main() -> None:
