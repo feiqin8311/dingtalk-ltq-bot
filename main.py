@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 from logistics_query import (
     BaosenLoginError,
+    query_tracking_number,
     load_env,
     find_order_by_fba,
     query_meitong,
@@ -46,6 +47,13 @@ _MESSAGE_DEDUP_TTL_SECONDS = 300
 _TRACK_QUERY_MAX_ATTEMPTS = 3
 _TRACK_QUERY_RETRY_DELAY_SECONDS = 2
 _SERIAL_BROWSER_TRACKING_PLATFORMS = {'agl', 'pingyi', 'baosen', '17track'}
+_BUSINESS_MENU_TEXT = (
+    "已重置当前选择。\n"
+    "请选择要办理的业务：\n"
+    "1. FBA查询\n"
+    "2. 跟踪号查询\n\n"
+    "回复【重置】➡️ 放弃本次并重新选择业务"
+)
 
 
 def _parse_track_time(value: str) -> datetime | None:
@@ -160,6 +168,7 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         super().__init__()
         self.logger = logging.getLogger(__name__)
         self._message_seen_at: dict[str, float] = {}
+        self._conversation_modes: dict[str, str] = {}
         self._browser_query_lock = asyncio.Lock()
         self._browser_queue_waiting = 0
         self._qq_query_lock = asyncio.Lock()
@@ -239,8 +248,71 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         for key in expired:
             self._message_seen_at.pop(key, None)
 
+    def _get_conversation_mode(self, conversation_id: str) -> str:
+        mode = self._conversation_modes.get(conversation_id, '')
+        return mode if mode in {'menu', 'fba', 'tracking'} else ''
+
+    def _set_conversation_mode(self, conversation_id: str, mode: str) -> None:
+        self._conversation_modes[conversation_id] = mode
+
+    def _reply_business_menu(self, incoming_message) -> None:
+        self.reply_text(_BUSINESS_MENU_TEXT, incoming_message)
+
+    async def _handle_fba_message(self, incoming_message, text_content: str):
+        await self._handle_fba_query(incoming_message, text_content)
+
+    async def _handle_tracking_message(self, incoming_message, text_content: str):
+        await self._handle_tracking_query(incoming_message, text_content)
+
     async def _handle_text_message(self, incoming_message, text_content: str):
         """处理文本消息"""
+        conversation_id = getattr(incoming_message, 'conversation_id', '')
+        normalized_text = text_content.strip()
+        mode = self._get_conversation_mode(conversation_id)
+
+        if normalized_text == '重置':
+            self._set_conversation_mode(conversation_id, 'menu')
+            self._reply_business_menu(incoming_message)
+            return
+
+        if not mode:
+            self._set_conversation_mode(conversation_id, 'menu')
+            self._reply_business_menu(incoming_message)
+            return
+
+        if mode == 'menu':
+            if normalized_text == '1':
+                self._set_conversation_mode(conversation_id, 'fba')
+                self.reply_text(
+                    '已切换到 FBA查询。后续消息将按 FBA 查询处理，回复【重置】可重新选择业务。',
+                    incoming_message,
+                )
+                return
+            if normalized_text == '2':
+                self._set_conversation_mode(conversation_id, 'tracking')
+                self.reply_text(
+                    '已切换到 跟踪号查询。后续消息将按跟踪号查询处理，回复【重置】可重新选择业务。',
+                    incoming_message,
+                )
+                return
+            self._reply_business_menu(incoming_message)
+            return
+
+        if mode == 'fba':
+            await self._handle_fba_message(incoming_message, text_content)
+            return
+
+        if mode == 'tracking':
+            await self._handle_tracking_message(incoming_message, text_content)
+            return
+
+        self._set_conversation_mode(conversation_id, 'menu')
+        self._reply_business_menu(incoming_message)
+        return
+
+    async def _handle_fba_query(self, incoming_message, text_content: str):
+        """处理 FBA 文本消息"""
+
         fba_code = text_content.strip()
 
         if not fba_code:
@@ -318,6 +390,17 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         except Exception as e:
             self.logger.error(f"查询失败: {e}", exc_info=True)
             self.reply_text(f"❌ 查询失败: {str(e)}", incoming_message)
+
+    async def _handle_tracking_query(self, incoming_message, text_content: str):
+        tracking_no = text_content.strip()
+        if not tracking_no:
+            self.reply_text("请发送要查询的跟踪号", incoming_message)
+            return
+        self.reply_text(f"收到，开始查询跟踪号 {tracking_no} ...", incoming_message)
+        result = await query_tracking_number(tracking_no)
+        reply_text = self._format_tracking_result(result, 'tracking')
+        if reply_text:
+            self.reply_text(reply_text, incoming_message)
 
     def _build_qq_pending_reply(self, order: dict) -> str:
         tracking_no = get_primary_logistics_no(order)
