@@ -46,6 +46,13 @@ _MESSAGE_DEDUP_TTL_SECONDS = 300
 _TRACK_QUERY_MAX_ATTEMPTS = 3
 _TRACK_QUERY_RETRY_DELAY_SECONDS = 2
 _SERIAL_BROWSER_TRACKING_PLATFORMS = {'agl', 'pingyi', 'baosen', '17track'}
+_BUSINESS_MENU_TEXT = (
+    "已重置当前选择。\n"
+    "请选择要办理的业务：\n"
+    "1. FBA查询\n"
+    "2. 跟踪号查询\n\n"
+    "回复【重置】➡️ 放弃本次并重新选择业务"
+)
 
 
 def _parse_track_time(value: str) -> datetime | None:
@@ -160,6 +167,7 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         super().__init__()
         self.logger = logging.getLogger(__name__)
         self._message_seen_at: dict[str, float] = {}
+        self._conversation_modes: dict[str, str] = {}
         self._browser_query_lock = asyncio.Lock()
         self._browser_queue_waiting = 0
         self._qq_query_lock = asyncio.Lock()
@@ -239,8 +247,32 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         for key in expired:
             self._message_seen_at.pop(key, None)
 
+    def _get_conversation_mode(self, conversation_id: str) -> str:
+        mode = self._conversation_modes.get(conversation_id, '')
+        return mode if mode in {'menu', 'fba', 'tracking'} else ''
+
+    def _set_conversation_mode(self, conversation_id: str, mode: str) -> None:
+        self._conversation_modes[conversation_id] = mode
+
+    def _reply_business_menu(self, incoming_message) -> None:
+        self.reply_text(_BUSINESS_MENU_TEXT, incoming_message)
+
     async def _handle_text_message(self, incoming_message, text_content: str):
         """处理文本消息"""
+        conversation_id = getattr(incoming_message, 'conversation_id', '')
+        normalized_text = text_content.strip()
+        mode = self._get_conversation_mode(conversation_id)
+
+        if normalized_text == '重置':
+            self._set_conversation_mode(conversation_id, 'menu')
+            self._reply_business_menu(incoming_message)
+            return
+
+        if not mode:
+            self._set_conversation_mode(conversation_id, 'menu')
+            self._reply_business_menu(incoming_message)
+            return
+
         fba_code = text_content.strip()
 
         if not fba_code:
