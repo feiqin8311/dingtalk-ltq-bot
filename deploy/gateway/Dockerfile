@@ -1,9 +1,6 @@
-FROM python:3.11-slim
+FROM tiangolo/uvicorn-gunicorn-fastapi:python3.11-slim
 
 WORKDIR /app
-
-COPY deploy/gateway/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY gateway_server.py /app/gateway_server.py
 

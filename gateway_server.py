@@ -1,8 +1,10 @@
 import asyncio
+import json
 import os
+import urllib.error
+import urllib.request
 from typing import Any
 
-import requests
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
@@ -80,14 +82,20 @@ def _build_upstream_headers() -> dict[str, str]:
 
 def _proxy_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"{_get_upstream_base_url()}{path}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=_build_upstream_headers(),
+        method="POST",
+    )
     try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers=_build_upstream_headers(),
-            timeout=_get_gateway_timeout(),
-        )
-    except requests.RequestException as exc:
+        with urllib.request.urlopen(request, timeout=_get_gateway_timeout()) as response:
+            status_code = response.status
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        status_code = exc.code
+        raw_body = exc.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
         return build_api_response(
             success=False,
             data=None,
@@ -95,12 +103,12 @@ def _proxy_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         )
 
     try:
-        body = response.json()
+        body = json.loads(raw_body)
     except ValueError:
         body = {
             "success": False,
             "data": None,
-            "error": f"上游返回非 JSON 响应: HTTP {response.status_code}",
+            "error": f"上游返回非 JSON 响应: HTTP {status_code}",
         }
 
     success = bool(body.get("success", False))
@@ -108,7 +116,7 @@ def _proxy_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     error = body.get("error")
 
     if not success and not error:
-        error = f"上游请求失败: HTTP {response.status_code}"
+        error = f"上游请求失败: HTTP {status_code}"
 
     return build_api_response(success=success, data=data, error=error)
 

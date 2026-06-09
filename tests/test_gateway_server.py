@@ -6,12 +6,21 @@ from unittest.mock import patch
 
 class _FakeResponse:
     def __init__(self, status_code=200, payload=None, text=""):
-        self.status_code = status_code
+        self.status = status_code
         self._payload = payload or {}
         self.text = text
 
-    def json(self):
-        return self._payload
+    def read(self):
+        return self.text.encode("utf-8") if self.text else __import__("json").dumps(self._payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def close(self):
+        return None
 
 
 class GatewayServerTests(unittest.IsolatedAsyncioTestCase):
@@ -50,8 +59,8 @@ class GatewayServerTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch.object(
-            gateway_server.requests,
-            "post",
+            gateway_server.urllib.request,
+            "urlopen",
             return_value=_FakeResponse(payload=upstream_payload),
         ) as mock_post:
             result = await gateway_server.query_tracking(payload)
@@ -71,9 +80,15 @@ class GatewayServerTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch.object(
-            gateway_server.requests,
-            "post",
-            return_value=_FakeResponse(status_code=404, payload=upstream_payload, text="not found"),
+            gateway_server.urllib.request,
+            "urlopen",
+            side_effect=gateway_server.urllib.error.HTTPError(
+                url="http://127.0.0.1:18081/api/fba/query",
+                code=404,
+                msg="Not Found",
+                hdrs=None,
+                fp=_FakeResponse(status_code=404, payload=upstream_payload),
+            ),
         ):
             result = await gateway_server.query_fba(payload)
 
