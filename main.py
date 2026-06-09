@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 from logistics_query import (
     BaosenLoginError,
+    query_tracking_number,
     load_env,
     find_order_by_fba,
     query_meitong,
@@ -396,6 +397,10 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
             self.reply_text("请发送要查询的跟踪号", incoming_message)
             return
         self.reply_text(f"收到，开始查询跟踪号 {tracking_no} ...", incoming_message)
+        result = await query_tracking_number(tracking_no)
+        reply_text = self._format_tracking_result(result, 'tracking')
+        if reply_text:
+            self.reply_text(reply_text, incoming_message)
 
     def _build_qq_pending_reply(self, order: dict) -> str:
         tracking_no = get_primary_logistics_no(order)

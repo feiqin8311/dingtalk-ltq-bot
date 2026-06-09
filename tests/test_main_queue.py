@@ -176,6 +176,7 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
         handler, main = self._make_handler()
         replies: list[str] = []
         handler.reply_text = lambda text, incoming_message: replies.append(text)
+        handler._conversation_modes["cid-1"] = "fba"
 
         order = {"货代公司": "金为", "物流编号": "KMFTORY2600585"}
         qq_result = {
@@ -204,6 +205,7 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
         handler, main = self._make_handler()
         replies: list[str] = []
         handler.reply_text = lambda text, incoming_message: replies.append(text)
+        handler._conversation_modes["cid-1"] = "fba"
 
         order = {"货代公司": "金为", "物流编号": "KMFTORY2600585"}
         qq_result = {
