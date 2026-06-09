@@ -134,4 +134,12 @@ if ($ResolvedCdpBrowser) {
     $env:LOCAL_CDP_BROWSER_BIN = $ResolvedCdpBrowser
 }
 
+$ApiHost = if ($EnvValues["API_HOST"]) { $EnvValues["API_HOST"] } else { "0.0.0.0" }
+$ApiPort = if ($EnvValues["API_PORT"]) { $EnvValues["API_PORT"] } else { "8000" }
+
+Start-Process `
+    -FilePath $PythonExe `
+    -ArgumentList @("-m", "uvicorn", "api_server:app", "--host", $ApiHost, "--port", $ApiPort) `
+    -WorkingDirectory $ProjectDir
+
 & $PythonExe (Join-Path $ProjectDir 'main.py')

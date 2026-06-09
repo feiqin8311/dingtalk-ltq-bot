@@ -1,0 +1,18 @@
+services:
+  logistics-query-gateway:
+    build:
+      context: ..
+      dockerfile: deploy/gateway/Dockerfile
+    container_name: logistics-query-gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-18743}:${GATEWAY_PORT:-18743}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "${GATEWAY_PORT:-18743}"
+      GATEWAY_AUTH_TOKEN: "${GATEWAY_AUTH_TOKEN:?set-in-env}"
+      UPSTREAM_API_BASE_URL: "${UPSTREAM_API_BASE_URL:-http://host.docker.internal:18781}"
+      UPSTREAM_API_TOKEN: "${UPSTREAM_API_TOKEN:-}"
+      GATEWAY_REQUEST_TIMEOUT: "${GATEWAY_REQUEST_TIMEOUT:-240}"
