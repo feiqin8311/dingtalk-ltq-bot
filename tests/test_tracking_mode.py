@@ -92,7 +92,13 @@ class TrackingModeMenuTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(handler._conversation_modes["cid-1"], "menu")
         self.assertEqual(len(replies), 1)
-        self.assertIn("已重置当前选择", replies[0])
+        self.assertEqual(
+            replies[0],
+            "请选择要办理的业务：\n"
+            "1. FBA查询\n"
+            "2. 跟踪号查询\n\n"
+            "回复【重置】➡️ 放弃本次并重新选择业务",
+        )
 
     async def test_reply_one_enters_fba_mode_and_uses_fba_flow(self):
         handler, _ = self._make_handler()
@@ -311,6 +317,21 @@ class TrackingModeMenuTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(logistics_query, "query_swiship_tracking", new=AsyncMock(return_value=expected)):
             result = await logistics_query.query_tracking_number("BNI123456789")
+
+        self.assertEqual(result, expected)
+
+    async def test_query_tracking_number_routes_to_amazon_uk_helper_for_uk(self):
+        import logistics_query
+
+        expected = {
+            "平台": "AMAZON_UK",
+            "查询值": "UK4413632304",
+            "物流轨迹": [],
+            "最新轨迹": {},
+        }
+
+        with patch.object(logistics_query, "query_amazon_uk_tracking", new=AsyncMock(return_value=expected)):
+            result = await logistics_query.query_tracking_number("UK4413632304")
 
         self.assertEqual(result, expected)
 

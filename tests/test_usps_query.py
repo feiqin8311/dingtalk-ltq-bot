@@ -1,6 +1,9 @@
 import unittest
 
-from logistics_query import extract_usps_tracking_items_from_html
+from logistics_query import (
+    extract_usps_tracking_items_from_html,
+    is_usps_blocked_page_html,
+)
 
 
 USPS_HTML = """
@@ -20,8 +23,24 @@ USPS_HTML = """
 </div>
 """
 
+USPS_BLOCKED_HTML = """
+<!DOCTYPE html><html><head>
+  <title></title>
+</head>
+<body>
+  <script>
+    var vendor = "akamai";
+    var note = "bot detection";
+  </script>
+</body>
+</html>
+"""
+
 
 class UspsQueryParsingTests(unittest.TestCase):
+    def test_detects_usps_blocked_blank_page(self):
+        self.assertTrue(is_usps_blocked_page_html(USPS_BLOCKED_HTML))
+
     def test_extract_usps_tracking_items_reads_current_and_history_steps(self):
         items = extract_usps_tracking_items_from_html(USPS_HTML)
 

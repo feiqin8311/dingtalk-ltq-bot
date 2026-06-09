@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import csv
 import glob
 import json
 import logging
@@ -90,6 +91,12 @@ def get_env(name: str) -> str:
 
 def clean_text(value: Any) -> str:
     return ' '.join(str(value).split()).strip()
+
+
+def normalize_optional_text(value: Any) -> str:
+    if value is None:
+        return ''
+    return clean_text(value)
 
 
 def normalize_tracking_number(value: Any) -> str:
@@ -1280,9 +1287,9 @@ def extract_uniuni_tracking_items_from_html(html: str) -> list[dict[str, str]]:
 
 def extract_usps_tracking_items_from_html(html: str) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
-    step_pattern = re.compile(r'<div[^>]*class="tb-step[^"]*"[^>]*>(.*?)</div>', re.S)
-
-    for block in step_pattern.findall(html):
+    blocks = html.split('class="tb-step')
+    for raw_block in blocks[1:]:
+        block = raw_block.split('class="tb-step', 1)[0]
         status_match = re.search(r'<p[^>]*class="tb-status"[^>]*>\s*(.*?)\s*</p>', block, re.S)
         detail_match = re.search(r'<p[^>]*class="tb-status-detail"[^>]*>\s*(.*?)\s*</p>', block, re.S)
         location_match = re.search(r'<p[^>]*class="tb-location"[^>]*>\s*(.*?)\s*</p>', block, re.S)
@@ -1312,24 +1319,124 @@ def extract_usps_tracking_items_from_html(html: str) -> list[dict[str, str]]:
     return items
 
 
+def is_usps_blocked_page_html(html: str) -> bool:
+    text = html or ''
+    lowered = text.lower()
+    if 'class="tb-step' in lowered or 'tb-status' in lowered:
+        return False
+    if '<title></title>' in lowered and 'akamai' in lowered:
+        return True
+    if '<title></title>' in lowered and 'bot' in lowered:
+        return True
+    if 'istl-referer' in lowered and 'xmlhttprequest' in lowered and 'tracking/?qtc_tlabels1=' in lowered:
+        return True
+    return False
+
+
+async def apply_usps_browser_stealth(context, page) -> None:
+    try:
+        await context.set_extra_http_headers(
+            {
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-CH-UA-Platform': '"Windows"',
+                'Sec-CH-UA-Mobile': '?0',
+            }
+        )
+    except Exception:
+        pass
+
+    try:
+        await page.set_viewport_size({'width': 1440, 'height': 900})
+    except Exception:
+        pass
+
+    try:
+        await page.add_init_script(
+            """
+            (() => {
+              const override = (obj, key, value) => {
+                try {
+                  Object.defineProperty(obj, key, { get: () => value, configurable: true });
+                } catch (e) {}
+              };
+              override(navigator, 'webdriver', undefined);
+              override(navigator, 'language', 'en-US');
+              override(navigator, 'languages', ['en-US', 'en']);
+              override(navigator, 'platform', 'Win32');
+              override(navigator, 'hardwareConcurrency', 8);
+              override(navigator, 'deviceMemory', 8);
+              override(navigator, 'maxTouchPoints', 0);
+              override(navigator, 'vendor', 'Google Inc.');
+              override(screen, 'colorDepth', 24);
+              override(screen, 'pixelDepth', 24);
+              override(window, 'innerWidth', 1440);
+              override(window, 'innerHeight', 900);
+              override(window, 'outerWidth', 1440);
+              override(window, 'outerHeight', 980);
+              if (!window.chrome) {
+                Object.defineProperty(window, 'chrome', {
+                  value: { runtime: {}, app: {}, csi: () => {}, loadTimes: () => ({}) },
+                  configurable: true,
+                });
+              }
+              if (!navigator.plugins || navigator.plugins.length === 0) {
+                Object.defineProperty(navigator, 'plugins', {
+                  get: () => [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin' },
+                  ],
+                  configurable: true,
+                });
+              }
+              if (!navigator.mimeTypes || navigator.mimeTypes.length === 0) {
+                Object.defineProperty(navigator, 'mimeTypes', {
+                  get: () => [
+                    { type: 'application/pdf' },
+                    { type: 'text/pdf' },
+                  ],
+                  configurable: true,
+                });
+              }
+              const originalQuery = navigator.permissions && navigator.permissions.query;
+              if (originalQuery) {
+                navigator.permissions.query = (parameters) => (
+                  parameters && parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters)
+                );
+              }
+            })();
+            """
+        )
+    except Exception:
+        pass
+
+
 def extract_ups_current_status_from_html(html: str) -> str:
-    active_match = re.search(
+    for active_match in re.finditer(
         r'<li[^>]*class="[^"]*progress-step[^"]*active[^"]*"[^>]*aria-current="true"[^>]*>(.*?)</li>',
         html,
         re.S,
-    )
-    if not active_match:
-        return ''
+    ):
+        block = active_match.group(1)
+        text_match = re.search(
+            r'<button[^>]*>\s*(.*?)\s*</button>',
+            block,
+            re.S,
+        )
+        if text_match:
+            text = clean_text(unescape(re.sub(r'<[^>]+>', '', text_match.group(1))))
+            if text:
+                return text
 
-    text_match = re.search(
-        r'<button[^>]*>\s*(?:<span[^>]*>)?\s*([^<]+?)\s*(?:</span>)?\s*</button>',
-        active_match.group(1),
-        re.S,
-    )
-    if not text_match:
-        return ''
-
-    return clean_text(unescape(re.sub(r'<[^>]+>', '', text_match.group(1))))
+        aria_match = re.search(r'aria-label="[^"]*:\s*([^"]+?)"', block, re.S)
+        if aria_match:
+            text = clean_text(unescape(re.sub(r'<[^>]+>', '', aria_match.group(1))))
+            if text:
+                return text
+    return ''
 
 
 def extract_swiship_tracking_summary_from_html(html: str) -> dict[str, str]:
@@ -1389,6 +1496,8 @@ def extract_amazon_us_status_from_html(html: str) -> str:
         re.S,
     )
     if not title_match:
+        title_match = re.search(r'<h1[^>]*>\s*(.*?)\s*</h1>', html, re.S)
+    if not title_match:
         return ''
     return clean_text(unescape(re.sub(r'<[^>]+>', '', title_match.group(1))))
 
@@ -1406,6 +1515,108 @@ def extract_amazon_us_not_found_error_from_html(html: str) -> str:
     if "We're sorry" in alert_text and "We couldn't find the package you're looking for" in alert_text:
         return alert_text
     return ''
+
+
+def extract_amazon_uk_tracking_items_from_html(html: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    current_date = ''
+    token_pattern = re.compile(
+        r'(<div[^>]*class="[^"]*css-1xz1o3r[^"]*"[^>]*>\s*<p[^>]*class="[^"]*css-1bhbd4d[^"]*"[^>]*>.*?</p>\s*</div>)'
+        r'|(<div[^>]*class="[^"]*css-193enz3[^"]*"[^>]*>.*?</div>\s*</div>)',
+        re.S,
+    )
+
+    for date_block, row_block in token_pattern.findall(html):
+        if date_block:
+            date_text = clean_text(unescape(re.sub(r'<[^>]+>', '', date_block)))
+            if date_text and '时间以当地时区显示' not in date_text and ':' not in date_text:
+                current_date = date_text
+            continue
+
+        if not row_block:
+            continue
+
+        time_match = re.search(
+            r'<p[^>]*class="[^"]*css-1bhbd4d[^"]*"[^>]*>\s*(.*?)\s*</p>',
+            row_block,
+            re.S,
+        )
+        detail_blocks = re.findall(r'<div[^>]*class="[^"]*css-1xz1o3r[^"]*"[^>]*>\s*(.*?)\s*</div>', row_block, re.S)
+        if not time_match or len(detail_blocks) < 2:
+            continue
+
+        time_text = clean_text(unescape(re.sub(r'<[^>]+>', '', time_match.group(1))))
+        status_text = clean_text(unescape(re.sub(r'<[^>]+>', '', detail_blocks[0])))
+        location_text = clean_text(unescape(re.sub(r'<[^>]+>', '', detail_blocks[1])))
+        if not time_text or not status_text:
+            continue
+
+        items.append(
+            {
+                '时间': clean_text(f'{current_date} {time_text}') if current_date else time_text,
+                '内容': status_text,
+                '地点': location_text,
+            }
+        )
+
+    return list(reversed(items))
+
+
+def extract_amazon_uk_summary_from_html(html: str) -> dict[str, str]:
+    title_match = re.search(
+        r'<h1[^>]*class="[^"]*css-alxyr3[^"]*"[^>]*>\s*(.*?)\s*</h1>',
+        html,
+        re.S,
+    )
+    if not title_match:
+        title_match = re.search(r'<h1[^>]*>\s*(.*?)\s*</h1>', html, re.S)
+
+    description_match = re.search(
+        r'<p[^>]*class="[^"]*_2VpQZN[^"]*"[^>]*>\s*(.*?)\s*</p>',
+        html,
+        re.S,
+    )
+    if not description_match:
+        description_match = re.search(
+            r'<h1[^>]*>.*?</h1>.*?<p[^>]*class="[^"]*css-1bhbd4d[^"]*"[^>]*>\s*(.*?)\s*</p>',
+            html,
+            re.S,
+        )
+
+    status = clean_text(unescape(re.sub(r'<[^>]+>', '', title_match.group(1)))) if title_match else ''
+    description = (
+        clean_text(unescape(re.sub(r'<[^>]+>', '', description_match.group(1))))
+        if description_match
+        else ''
+    )
+    return {
+        '状态': status,
+        '说明': description,
+    }
+
+
+def build_amazon_us_debug_dir(day: str | None = None) -> Path:
+    normalized_day = clean_text(day or datetime.now(UTC).date().isoformat()) or datetime.now(UTC).date().isoformat()
+    root_dir = Path(__file__).resolve().parent / 'tmp'
+    return root_dir / 'amazon-us-debug' / normalized_day
+
+
+def build_amazon_uk_debug_dir(day: str | None = None) -> Path:
+    normalized_day = clean_text(day or datetime.now(UTC).date().isoformat()) or datetime.now(UTC).date().isoformat()
+    root_dir = Path(__file__).resolve().parent / 'tmp'
+    return root_dir / 'amazon-uk-debug' / normalized_day
+
+
+def build_gofo_debug_dir(day: str | None = None) -> Path:
+    normalized_day = clean_text(day or datetime.now().strftime('%Y-%m-%d')) or datetime.now().strftime('%Y-%m-%d')
+    root_dir = Path(__file__).resolve().parent / 'tmp'
+    return root_dir / 'gofo-debug' / normalized_day
+
+
+def build_usps_debug_dir(day: str | None = None) -> Path:
+    normalized_day = clean_text(day or datetime.now().strftime('%Y-%m-%d')) or datetime.now().strftime('%Y-%m-%d')
+    root_dir = Path(__file__).resolve().parent / 'tmp'
+    return root_dir / 'usps-debug' / normalized_day
 
 
 async def query_17track(order_no: str) -> dict[str, Any]:
@@ -2369,7 +2580,7 @@ async def query_tracking_number(tracking_no: str) -> dict[str, Any]:
 
 def build_gofo_download_dir(base_dir: Path | None = None, day_text: str | None = None) -> Path:
     root_dir = base_dir or Path('tmp')
-    normalized_day = clean_text(day_text) or datetime.now().strftime('%Y-%m-%d')
+    normalized_day = normalize_optional_text(day_text) or datetime.now().strftime('%Y-%m-%d')
     return root_dir / 'tracking-downloads' / normalized_day / 'gofo'
 
 
@@ -2397,11 +2608,40 @@ def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
     return values
 
 
+def _xlsx_cell_text(cell: ElementTree.Element, namespace: dict[str, str], shared_strings: list[str]) -> str:
+    cell_type = cell.attrib.get('t', '')
+    if cell_type == 'inlineStr':
+        inline_node = cell.find('s:is', namespace)
+        if inline_node is None:
+            return ''
+        return clean_text(''.join(inline_node.itertext()))
+
+    value_node = cell.find('s:v', namespace)
+    raw_value = clean_text(value_node.text if value_node is not None else '')
+    if cell_type == 's' and raw_value:
+        index = int(raw_value)
+        return shared_strings[index] if index < len(shared_strings) else ''
+    return raw_value
+
+
 def parse_gofo_export_summary_xlsx(path: Path) -> dict[str, str]:
     namespace = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-    with zipfile.ZipFile(path) as archive:
-        shared_strings = _xlsx_shared_strings(archive)
-        payload = archive.read('xl/worksheets/sheet1.xml')
+    try:
+        with zipfile.ZipFile(path) as archive:
+            shared_strings = _xlsx_shared_strings(archive)
+            payload = archive.read('xl/worksheets/sheet1.xml')
+    except zipfile.BadZipFile:
+        text = path.read_text(encoding='utf-8-sig', errors='ignore').replace('\t', '')
+        reader = csv.reader(text.splitlines())
+        rows = [row for row in reader if any(clean_text(cell) for cell in row)]
+        if len(rows) < 2:
+            raise RuntimeError('GOFO 导出文件没有有效数据行')
+        headers = [clean_text(header) for header in rows[0]]
+        values = [clean_text(value) for value in rows[1]]
+        row = {key: values[index] if index < len(values) else '' for index, key in enumerate(headers) if key}
+        if 'Current status' not in row:
+            raise RuntimeError('GOFO 导出文件缺少 Current status 字段')
+        return row
 
     root = ElementTree.fromstring(payload)
     rows = root.findall('.//s:sheetData/s:row', namespace)
@@ -2411,14 +2651,7 @@ def parse_gofo_export_summary_xlsx(path: Path) -> dict[str, str]:
     def row_values(row) -> list[str]:
         values: list[str] = []
         for cell in row.findall('s:c', namespace):
-            cell_type = cell.attrib.get('t', '')
-            value_node = cell.find('s:v', namespace)
-            raw_value = clean_text(value_node.text if value_node is not None else '')
-            if cell_type == 's' and raw_value:
-                index = int(raw_value)
-                values.append(shared_strings[index] if index < len(shared_strings) else '')
-            else:
-                values.append(raw_value)
+            values.append(_xlsx_cell_text(cell, namespace, shared_strings))
         return values
 
     headers = row_values(rows[0])
@@ -2431,7 +2664,7 @@ def parse_gofo_export_summary_xlsx(path: Path) -> dict[str, str]:
 
 def build_yuntrack_download_dir(base_dir: Path | None = None, day_text: str | None = None) -> Path:
     root_dir = base_dir or Path('tmp')
-    normalized_day = clean_text(day_text) or datetime.now().strftime('%Y-%m-%d')
+    normalized_day = normalize_optional_text(day_text) or datetime.now().strftime('%Y-%m-%d')
     return root_dir / 'tracking-downloads' / normalized_day / 'yuntrack'
 
 
@@ -2446,9 +2679,22 @@ def build_yuntrack_download_path(
 
 def parse_yuntrack_export_summary_xlsx(path: Path) -> dict[str, str]:
     namespace = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-    with zipfile.ZipFile(path) as archive:
-        shared_strings = _xlsx_shared_strings(archive)
-        payload = archive.read('xl/worksheets/sheet1.xml')
+    try:
+        with zipfile.ZipFile(path) as archive:
+            shared_strings = _xlsx_shared_strings(archive)
+            payload = archive.read('xl/worksheets/sheet1.xml')
+    except zipfile.BadZipFile:
+        text = path.read_text(encoding='utf-8-sig', errors='ignore').replace('\t', '')
+        reader = csv.reader(text.splitlines())
+        rows = [row for row in reader if any(clean_text(cell) for cell in row)]
+        if len(rows) < 2:
+            raise RuntimeError('YunTrack 导出文件没有有效数据行')
+        headers = [clean_text(header) for header in rows[0]]
+        values = [clean_text(value) for value in rows[1]]
+        row = {key: values[index] if index < len(values) else '' for index, key in enumerate(headers) if key}
+        if 'Delivery Status' not in row:
+            raise RuntimeError('YunTrack 导出文件缺少 Delivery Status 字段')
+        return row
 
     root = ElementTree.fromstring(payload)
     rows = root.findall('.//s:sheetData/s:row', namespace)
@@ -2458,14 +2704,7 @@ def parse_yuntrack_export_summary_xlsx(path: Path) -> dict[str, str]:
     def row_values(row) -> list[str]:
         values: list[str] = []
         for cell in row.findall('s:c', namespace):
-            cell_type = cell.attrib.get('t', '')
-            value_node = cell.find('s:v', namespace)
-            raw_value = clean_text(value_node.text if value_node is not None else '')
-            if cell_type == 's' and raw_value:
-                index = int(raw_value)
-                values.append(shared_strings[index] if index < len(shared_strings) else '')
-            else:
-                values.append(raw_value)
+            values.append(_xlsx_cell_text(cell, namespace, shared_strings))
         return values
 
     headers = row_values(rows[0])
@@ -2477,6 +2716,7 @@ def parse_yuntrack_export_summary_xlsx(path: Path) -> dict[str, str]:
 
 
 async def query_uniuni_tracking(tracking_no: str) -> dict[str, Any]:
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     from playwright.async_api import async_playwright
 
     normalized = normalize_tracking_number(tracking_no)
@@ -2491,10 +2731,65 @@ async def query_uniuni_tracking(tracking_no: str) -> dict[str, Any]:
         page = await context.new_page()
 
         try:
-            await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
-            await page.wait_for_timeout(2000)
+            await apply_usps_browser_stealth(context, page)
+            async def _dump_debug_artifacts() -> tuple[str, str, str]:
+                title = ''
+                url = page.url
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ''
+                html = await page.content()
+                debug_dir = (Path(__file__).resolve().parent / 'tmp' / 'uniuni-debug' / datetime.now().strftime('%Y-%m-%d'))
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                html_path = debug_dir / f'{normalized}.html'
+                screenshot_path = debug_dir / f'{normalized}.png'
+                html_path.write_text(html, encoding='utf-8')
+                try:
+                    await page.screenshot(path=str(screenshot_path), full_page=True)
+                except Exception:
+                    pass
+                return title, url, str(html_path)
 
-            tracking_locator = page.get_by_text(normalized, exact=True).first
+            tracking_locator = page.locator(f'div:has-text("{normalized}")').first
+
+            for attempt in range(1, 4):
+                if attempt == 1:
+                    await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
+                else:
+                    logger.warning("UNIUNI 查询: 页面未返回轨迹，刷新重试 tracking_no=%s attempt=%s", normalized, attempt - 1)
+                    await page.reload(wait_until='domcontentloaded', timeout=60000)
+
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=20000)
+                except PlaywrightTimeoutError:
+                    await page.wait_for_timeout(3000)
+
+                try:
+                    await tracking_locator.wait_for(timeout=30000)
+                except PlaywrightTimeoutError:
+                    await page.wait_for_timeout(3000)
+
+                if await tracking_locator.count() == 0:
+                    continue
+
+                for click_attempt in range(2):
+                    try:
+                        await tracking_locator.click(timeout=10000)
+                    except Exception:
+                        continue
+                    await page.wait_for_timeout(2500 if click_attempt == 0 else 3500)
+                    html = await page.content()
+                    items = extract_uniuni_tracking_items_from_html(html)
+                    if items:
+                        return {
+                            '平台': 'UNIUNI',
+                            '查询值': normalized,
+                            '物流轨迹': items,
+                            '最新轨迹': items[0],
+                        }
+
+            title, current_url, html_path = await _dump_debug_artifacts()
             if await tracking_locator.count() == 0:
                 return {
                     '平台': 'UNIUNI',
@@ -2502,34 +2797,20 @@ async def query_uniuni_tracking(tracking_no: str) -> dict[str, Any]:
                     '物流轨迹': [],
                     '最新轨迹': {},
                     '错误': '未找到 UNIUNI 跟踪号结果',
-                }
-
-            await tracking_locator.click(timeout=10000)
-            await page.wait_for_timeout(2000)
-
-            html = await page.content()
-            items = extract_uniuni_tracking_items_from_html(html)
-
-            if not items:
-                await tracking_locator.click(timeout=10000)
-                await page.wait_for_timeout(2000)
-                html = await page.content()
-                items = extract_uniuni_tracking_items_from_html(html)
-
-            if not items:
-                return {
-                    '平台': 'UNIUNI',
-                    '查询值': normalized,
-                    '物流轨迹': [],
-                    '最新轨迹': {},
-                    '错误': 'UNIUNI 页面未返回轨迹信息',
+                    '当前页面标题': title,
+                    '当前URL': current_url,
+                    '调试HTML': html_path,
                 }
 
             return {
                 '平台': 'UNIUNI',
                 '查询值': normalized,
-                '物流轨迹': items,
-                '最新轨迹': items[0],
+                '物流轨迹': [],
+                '最新轨迹': {},
+                '错误': 'UNIUNI 页面未返回轨迹信息',
+                '当前页面标题': title,
+                '当前URL': current_url,
+                '调试HTML': html_path,
             }
         finally:
             await page.close()
@@ -2552,30 +2833,102 @@ async def query_gofo_tracking(tracking_no: str) -> dict[str, Any]:
         page = await context.new_page()
 
         try:
-            await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
-            await page.wait_for_timeout(2000)
+            async def _dump_debug_artifacts() -> tuple[str, str, str]:
+                title = ''
+                url = page.url
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ''
+                html = await page.content()
+                debug_dir = build_gofo_debug_dir()
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                html_path = debug_dir / f'{normalized}.html'
+                screenshot_path = debug_dir / f'{normalized}.png'
+                html_path.write_text(html, encoding='utf-8')
+                try:
+                    await page.screenshot(path=str(screenshot_path), full_page=True)
+                except Exception:
+                    pass
+                logger.warning(
+                    "GOFO 查询调试文件已保存 tracking_no=%s title=%s url=%s html=%s screenshot=%s",
+                    normalized,
+                    title,
+                    url,
+                    html_path,
+                    screenshot_path,
+                )
+                return title, url, str(html_path)
 
-            export_button = page.get_by_role('button', name='COPY & EXPORT').first
-            if await export_button.count() == 0:
+            await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
+            try:
+                await page.wait_for_load_state('networkidle', timeout=20000)
+            except PlaywrightTimeoutError:
+                await page.wait_for_timeout(3000)
+
+            found_gofo_entry = False
+            for locator in [
+                page.get_by_role('button', name='COPY & EXPORT').first,
+                page.get_by_role('button', name='Copy & Export').first,
+                page.locator('button:has-text("COPY & EXPORT")').first,
+                page.locator('button:has-text("Copy & Export")').first,
+                page.locator('button[id*="dropdown"]').first,
+                page.locator('[role="button"]:has-text("EXPORT")').first,
+                page.get_by_text('Export Summary', exact=False).first,
+            ]:
+                try:
+                    await locator.wait_for(timeout=6000)
+                    found_gofo_entry = True
+                    break
+                except Exception:
+                    continue
+            if not found_gofo_entry:
+                await page.wait_for_timeout(5000)
+
+            export_button = None
+            for locator in [
+                page.get_by_role('button', name='COPY & EXPORT').first,
+                page.get_by_role('button', name='Copy & Export').first,
+                page.locator('button:has-text("COPY & EXPORT")').first,
+                page.locator('button:has-text("Copy & Export")').first,
+                page.locator('button[id*="dropdown"]').first,
+                page.locator('[role="button"]:has-text("EXPORT")').first,
+            ]:
+                try:
+                    if await locator.count() > 0:
+                        export_button = locator
+                        break
+                except Exception:
+                    continue
+
+            if export_button is None:
+                title, current_url, html_path = await _dump_debug_artifacts()
                 return {
                     '平台': 'GOFO',
                     '查询值': normalized,
                     '物流轨迹': [],
                     '最新轨迹': {},
                     '错误': 'GOFO 页面未找到导出入口',
+                    '当前页面标题': title,
+                    '当前URL': current_url,
+                    '调试HTML': html_path,
                 }
 
             await export_button.click(timeout=10000)
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(1000)
 
             export_menu_item = page.get_by_text('Export Summary', exact=False).first
             if await export_menu_item.count() == 0:
+                title, current_url, html_path = await _dump_debug_artifacts()
                 return {
                     '平台': 'GOFO',
                     '查询值': normalized,
                     '物流轨迹': [],
                     '最新轨迹': {},
                     '错误': 'GOFO 页面未找到 Export Summary 菜单',
+                    '当前页面标题': title,
+                    '当前URL': current_url,
+                    '调试HTML': html_path,
                 }
 
             target_path = build_gofo_download_path(normalized)
@@ -2587,12 +2940,16 @@ async def query_gofo_tracking(tracking_no: str) -> dict[str, Any]:
                 download = await download_info.value
                 await download.save_as(str(target_path))
             except PlaywrightTimeoutError:
+                title, current_url, html_path = await _dump_debug_artifacts()
                 return {
                     '平台': 'GOFO',
                     '查询值': normalized,
                     '物流轨迹': [],
                     '最新轨迹': {},
                     '错误': 'GOFO 导出文件下载失败',
+                    '当前页面标题': title,
+                    '当前URL': current_url,
+                    '调试HTML': html_path,
                 }
 
             try:
@@ -2629,46 +2986,134 @@ async def query_gofo_tracking(tracking_no: str) -> dict[str, Any]:
 
 
 async def query_usps_tracking(tracking_no: str) -> dict[str, Any]:
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     from playwright.async_api import async_playwright
 
     normalized = normalize_tracking_number(tracking_no)
-    query_url = f'https://zh-tools.usps.com/tracking/{normalized}'
+    query_url = f'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1={normalized}'
     logger.info("USPS 查询: tracking_no=%s", normalized)
 
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        contexts = browser.contexts
-        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
-        page = await context.new_page()
+        context = await browser.new_context(
+            viewport={'width': 1440, 'height': 900},
+            user_agent=(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/137.0.0.0 Safari/537.36'
+            ),
+            locale='en-US',
+            timezone_id='America/Chicago',
+            color_scheme='light',
+        )
+        host_page = None
+        for existing_context in browser.contexts:
+            try:
+                if existing_context.pages:
+                    candidate = existing_context.pages[0]
+                    candidate_url = candidate.url or ''
+                    if candidate_url in {'', 'about:blank'}:
+                        host_page = candidate
+                        break
+            except Exception:
+                continue
+        page = host_page or await context.new_page()
 
         try:
-            await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
-            await page.wait_for_timeout(2000)
-            html = await page.content()
-            items = extract_usps_tracking_items_from_html(html)
+            await apply_usps_browser_stealth(context, page)
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+            async def _dump_debug_artifacts() -> tuple[str, str, str]:
+                title = ''
+                url = page.url
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ''
+                html = await page.content()
+                debug_dir = build_usps_debug_dir()
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                html_path = debug_dir / f'{normalized}.html'
+                screenshot_path = debug_dir / f'{normalized}.png'
+                html_path.write_text(html, encoding='utf-8')
+                try:
+                    await page.screenshot(path=str(screenshot_path), full_page=True)
+                except Exception:
+                    pass
+                logger.warning(
+                    "USPS 查询调试文件已保存 tracking_no=%s title=%s url=%s html=%s screenshot=%s",
+                    normalized,
+                    title,
+                    url,
+                    html_path,
+                    screenshot_path,
+                )
+                return title, url, str(html_path)
 
-            if not items:
-                return {
-                    '平台': 'USPS',
-                    '查询值': normalized,
-                    '物流轨迹': [],
-                    '最新轨迹': {},
-                    '错误': 'USPS 页面未返回轨迹信息',
-                }
+            for attempt in range(1, 4):
+                if attempt == 1:
+                    try:
+                        await page.goto('https://tools.usps.com/', wait_until='domcontentloaded', timeout=60000)
+                        await page.wait_for_timeout(2500)
+                    except Exception:
+                        pass
+                    await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
+                else:
+                    logger.warning("USPS 查询: 页面未返回轨迹，刷新重试 tracking_no=%s attempt=%s", normalized, attempt - 1)
+                    await page.reload(wait_until='domcontentloaded', timeout=60000)
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=20000)
+                except PlaywrightTimeoutError:
+                    pass
+                await page.wait_for_timeout(8000 + attempt * 3000)
+                try:
+                    await page.wait_for_selector('div.tb-step, p.tb-status, p.tb-status-detail', timeout=45000)
+                except PlaywrightTimeoutError:
+                    await page.wait_for_timeout(5000)
+                html = await page.content()
+                if is_usps_blocked_page_html(html):
+                    title, current_url, html_path = await _dump_debug_artifacts()
+                    return {
+                        '平台': 'USPS',
+                        '查询值': normalized,
+                        '物流轨迹': [],
+                        '最新轨迹': {},
+                        '错误': 'USPS 官网触发风控拦截，页面返回空白校验页',
+                        '当前页面标题': title,
+                        '当前URL': current_url,
+                        '调试HTML': html_path,
+                    }
+                items = extract_usps_tracking_items_from_html(html)
+                if items:
+                    return {
+                        '平台': 'USPS',
+                        '查询值': normalized,
+                        '物流轨迹': items,
+                        '最新轨迹': items[0],
+                    }
 
+            title, current_url, html_path = await _dump_debug_artifacts()
             return {
                 '平台': 'USPS',
                 '查询值': normalized,
-                '物流轨迹': items,
-                '最新轨迹': items[0],
+                '物流轨迹': [],
+                '最新轨迹': {},
+                '错误': 'USPS 页面未返回轨迹信息',
+                '当前页面标题': title,
+                '当前URL': current_url,
+                '调试HTML': html_path,
             }
         finally:
-            await page.close()
+            if host_page is None:
+                await page.close()
             end_local_cdp_session(cdp_process)
 
 
 async def query_ups_tracking(tracking_no: str) -> dict[str, Any]:
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     from playwright.async_api import async_playwright
 
     normalized = normalize_tracking_number(tracking_no)
@@ -2683,26 +3128,38 @@ async def query_ups_tracking(tracking_no: str) -> dict[str, Any]:
         page = await context.new_page()
 
         try:
-            await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
-            await page.wait_for_timeout(2000)
-            html = await page.content()
-            status = extract_ups_current_status_from_html(html)
+            for attempt in range(1, 4):
+                if attempt == 1:
+                    await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
+                else:
+                    logger.warning("UPS 查询: 页面未返回状态，刷新重试 tracking_no=%s attempt=%s", normalized, attempt - 1)
+                    await page.reload(wait_until='domcontentloaded', timeout=60000)
 
-            if not status:
-                return {
-                    '平台': 'UPS',
-                    '查询值': normalized,
-                    '物流轨迹': [],
-                    '最新轨迹': {},
-                    '错误': 'UPS 页面未返回当前物流状态',
-                }
+                try:
+                    await page.wait_for_selector(
+                        'li.progress-step[aria-current="true"], ups-ac-progress-bar, #stApp_shpmtProgress',
+                        timeout=45000,
+                    )
+                except PlaywrightTimeoutError:
+                    await page.wait_for_timeout(5000)
 
-            latest_track = {'时间': '', '内容': status, '地点': ''}
+                html = await page.content()
+                status = extract_ups_current_status_from_html(html)
+                if status:
+                    latest_track = {'时间': '', '内容': status, '地点': ''}
+                    return {
+                        '平台': 'UPS',
+                        '查询值': normalized,
+                        '物流轨迹': [latest_track],
+                        '最新轨迹': latest_track,
+                    }
+
             return {
                 '平台': 'UPS',
                 '查询值': normalized,
-                '物流轨迹': [latest_track],
-                '最新轨迹': latest_track,
+                '物流轨迹': [],
+                '最新轨迹': {},
+                '错误': 'UPS 页面未返回当前物流状态',
             }
         finally:
             await page.close()
@@ -2802,13 +3259,156 @@ async def query_yuntrack_tracking(tracking_no: str) -> dict[str, Any]:
 
 
 async def query_amazon_uk_tracking(tracking_no: str) -> dict[str, Any]:
-    return {
-        '平台': 'AMAZON_UK',
-        '查询值': tracking_no,
-        '物流轨迹': [],
-        '最新轨迹': {},
-        '错误': 'Amazon UK 查询尚未接入',
-    }
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.async_api import async_playwright
+
+    normalized = normalize_tracking_number(tracking_no)
+    query_url = f'https://track.amazon.co.uk/tracking/{normalized}?trackingId={normalized}'
+    logger.info("Amazon UK 查询: tracking_no=%s", normalized)
+
+    cdp_process = begin_local_cdp_session()
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
+        contexts = browser.contexts
+        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
+        page = await context.new_page()
+
+        try:
+            async def _dump_debug_artifacts() -> tuple[str, str, str]:
+                title = ''
+                url = page.url
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ''
+
+                html = await page.content()
+                debug_dir = build_amazon_uk_debug_dir()
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                html_path = debug_dir / f'{normalized}.html'
+                screenshot_path = debug_dir / f'{normalized}.png'
+                html_path.write_text(html, encoding='utf-8')
+                try:
+                    await page.screenshot(path=str(screenshot_path), full_page=True)
+                except Exception as exc:
+                    logger.warning("Amazon UK 查询: 截图失败 tracking_no=%s error=%s", normalized, exc)
+                logger.warning(
+                    "Amazon UK 查询调试文件已保存 tracking_no=%s title=%s url=%s html=%s screenshot=%s",
+                    normalized,
+                    title,
+                    url,
+                    html_path,
+                    screenshot_path,
+                )
+                return title, url, str(html_path)
+
+            async def _dismiss_cookie_banner() -> None:
+                for selector in ['#decline-button', '#accept-button']:
+                    button = page.locator(selector).first
+                    try:
+                        if await button.count() == 0 or not await button.is_visible(timeout=500):
+                            continue
+                        await button.click(timeout=5000)
+                        await page.wait_for_timeout(1000)
+                        return
+                    except Exception:
+                        continue
+
+            async def _find_expand_button():
+                for text in ['查看所有更新', 'View all updates', 'See all updates']:
+                    button = page.get_by_text(text, exact=False).first
+                    try:
+                        if await button.count() > 0:
+                            return button
+                    except Exception:
+                        continue
+                return None
+
+            for attempt in range(1, 4):
+                if attempt == 1:
+                    await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
+                else:
+                    logger.warning(
+                        "Amazon UK 查询: 页面长时间无可用轨迹，刷新重试 tracking_no=%s attempt=%s",
+                        normalized,
+                        attempt - 1,
+                    )
+                    await page.reload(wait_until='domcontentloaded', timeout=60000)
+
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=20000)
+                except PlaywrightTimeoutError:
+                    await page.wait_for_timeout(3000)
+
+                await _dismiss_cookie_banner()
+
+                try:
+                    await page.wait_for_selector(
+                        'h1.css-alxyr3, div.css-193enz3, button:has-text("See all updates"), '
+                        'button:has-text("View all updates"), button:has-text("查看所有更新")',
+                        timeout=45000,
+                    )
+                except PlaywrightTimeoutError:
+                    await page.wait_for_timeout(5000)
+
+                html = await page.content()
+                summary = extract_amazon_uk_summary_from_html(html)
+                items = extract_amazon_uk_tracking_items_from_html(html)
+
+                expand_button = await _find_expand_button()
+                if not items and expand_button is not None:
+                    try:
+                        await expand_button.wait_for(timeout=10000)
+                        await expand_button.click(timeout=10000)
+                        try:
+                            await page.wait_for_selector('div.css-193enz3', timeout=30000)
+                        except PlaywrightTimeoutError:
+                            await page.wait_for_timeout(5000)
+                        html = await page.content()
+                        summary = extract_amazon_uk_summary_from_html(html)
+                        items = extract_amazon_uk_tracking_items_from_html(html)
+                    except Exception as exc:
+                        logger.warning("Amazon UK 查询: 展开轨迹失败 tracking_no=%s error=%s", normalized, exc)
+
+                if items:
+                    return {
+                        '平台': 'AMAZON_UK',
+                        '查询值': normalized,
+                        '物流轨迹': items,
+                        '最新轨迹': items[0],
+                    }
+
+                summary_status = clean_text(summary.get('状态', ''))
+                if summary_status:
+                    summary_text = summary_status
+                    if clean_text(summary.get('说明', '')):
+                        summary_text = f'{summary_status} - {clean_text(summary["说明"])}'
+                    fallback_item = {
+                        '时间': '',
+                        '内容': summary_text,
+                        '地点': '',
+                    }
+                    return {
+                        '平台': 'AMAZON_UK',
+                        '查询值': normalized,
+                        '物流轨迹': [fallback_item],
+                        '最新轨迹': fallback_item,
+                    }
+
+            title, current_url, html_path = await _dump_debug_artifacts()
+            return {
+                '平台': 'AMAZON_UK',
+                '查询值': normalized,
+                '物流轨迹': [],
+                '最新轨迹': {},
+                '错误': 'Amazon UK 页面未返回轨迹信息',
+                '当前页面标题': title,
+                '当前URL': current_url,
+                '调试HTML': html_path,
+            }
+        finally:
+            await page.close()
+            end_local_cdp_session(cdp_process)
 
 
 async def query_swiship_tracking(tracking_no: str) -> dict[str, Any]:
@@ -2882,24 +3482,101 @@ async def query_amazon_us_tracking(tracking_no: str) -> dict[str, Any]:
                 error_text = extract_amazon_us_not_found_error_from_html(html)
                 return status_text, error_text
 
+            async def _refresh_current_page() -> tuple[str, str]:
+                await page.reload(wait_until='domcontentloaded', timeout=60000)
+                return await _read_status_from_current_page()
+
+            async def _submit_search_on_current_page() -> tuple[str, str]:
+                search_input = page.locator('input.search-input, input[name="trackingId"]').first
+                await search_input.wait_for(timeout=30000)
+                await search_input.click(timeout=10000)
+                await search_input.fill(normalized)
+                submit_button = page.locator('button.form-button, button[type="submit"]').first
+                if await submit_button.count() > 0:
+                    await submit_button.click(timeout=10000)
+                else:
+                    await search_input.press('Enter')
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=20000)
+                except Exception:
+                    await page.wait_for_timeout(3000)
+                return await _read_status_from_current_page()
+
             async def _query_from_home_page() -> tuple[str, str]:
                 await page.goto(home_url, wait_until='domcontentloaded', timeout=60000)
-                search_input = page.locator('input.search-input').first
-                await search_input.wait_for(timeout=30000)
-                await search_input.fill(normalized)
-                await page.get_by_role('button', name='Track').first.click(timeout=10000)
-                return await _read_status_from_current_page()
+                return await _submit_search_on_current_page()
+
+            async def _query_from_current_page_search() -> tuple[str, str]:
+                logger.warning("Amazon US 查询: 当前页仅加载壳层，尝试在当前页重新提交搜索 tracking_no=%s", normalized)
+                return await _submit_search_on_current_page()
+
+            async def _page_looks_like_shell_without_result() -> bool:
+                body_text = clean_text(await page.locator('body').inner_text(timeout=5000))
+                return (
+                    normalized in body_text
+                    and 'Track a Package' in body_text
+                    and 'Enter a tracking ID' in body_text
+                    and not extract_amazon_us_status_from_html(await page.content())
+                    and not extract_amazon_us_not_found_error_from_html(await page.content())
+                )
+
+            async def _dump_debug_artifacts() -> tuple[str, str, str]:
+                title = ''
+                url = page.url
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ''
+
+                html = await page.content()
+                debug_dir = build_amazon_us_debug_dir()
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                html_path = debug_dir / f'{normalized}.html'
+                screenshot_path = debug_dir / f'{normalized}.png'
+                html_path.write_text(html, encoding='utf-8')
+                try:
+                    await page.screenshot(path=str(screenshot_path), full_page=True)
+                except Exception as exc:
+                    logger.warning("Amazon US 查询: 截图失败 tracking_no=%s error=%s", normalized, exc)
+                logger.warning(
+                    "Amazon US 查询调试文件已保存 tracking_no=%s title=%s url=%s html=%s screenshot=%s",
+                    normalized,
+                    title,
+                    url,
+                    html_path,
+                    screenshot_path,
+                )
+                return title, url, str(html_path)
 
             await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
             status, error_text = await _read_status_from_current_page()
 
-            retry_limit = 2
-            retry_count = 0
-            while not status and error_text and retry_count < retry_limit:
-                retry_count += 1
+            refresh_retry_limit = 2
+            refresh_retry_count = 0
+            while not status and not error_text and refresh_retry_count < refresh_retry_limit:
+                refresh_retry_count += 1
+                logger.warning(
+                    "Amazon US 查询: 页面长时间无状态响应，刷新重试 tracking_no=%s attempt=%s",
+                    normalized,
+                    refresh_retry_count,
+                )
+                status, error_text = await _refresh_current_page()
+
+            if not status and not error_text:
+                try:
+                    if await _page_looks_like_shell_without_result():
+                        status, error_text = await _query_from_current_page_search()
+                except Exception as exc:
+                    logger.warning("Amazon US 查询: 当前页重提搜索失败 tracking_no=%s error=%s", normalized, exc)
+
+            home_retry_limit = 2
+            home_retry_count = 0
+            while not status and error_text and home_retry_count < home_retry_limit:
+                home_retry_count += 1
                 status, error_text = await _query_from_home_page()
 
             if not status:
+                title, current_url, html_path = await _dump_debug_artifacts()
                 error_message = 'Amazon US 页面未返回状态标题'
                 if error_text:
                     error_message = f'Amazon US 页面未找到包裹: {error_text}'
@@ -2909,6 +3586,9 @@ async def query_amazon_us_tracking(tracking_no: str) -> dict[str, Any]:
                     '物流轨迹': [],
                     '最新轨迹': {},
                     '错误': error_message,
+                    '当前页面标题': title,
+                    '当前URL': current_url,
+                    '调试HTML': html_path,
                 }
 
             latest_track = {'时间': '', '内容': status, '地点': ''}

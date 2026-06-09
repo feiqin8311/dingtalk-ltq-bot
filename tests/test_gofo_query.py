@@ -62,6 +62,50 @@ def _build_xlsx_bytes(headers, row):
     return buffer.getvalue()
 
 
+def _build_inline_str_xlsx_bytes(headers, row):
+    workbook = """<?xml version="1.0" encoding="UTF-8"?>
+    <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+      <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+    </workbook>"""
+    workbook_rels = """<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+    </Relationships>"""
+    content_types = """<?xml version="1.0" encoding="UTF-8"?>
+    <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+      <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+      <Default Extension="xml" ContentType="application/xml"/>
+      <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+      <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+    </Types>"""
+    root_rels = """<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+    </Relationships>"""
+    header_cells = []
+    row_cells = []
+    for index, value in enumerate(headers):
+        column = chr(ord("A") + index)
+        header_cells.append(f'<c r="{column}1" t="inlineStr"><is><t>{value}</t></is></c>')
+    for index, value in enumerate(row):
+        column = chr(ord("A") + index)
+        row_cells.append(f'<c r="{column}2" t="inlineStr"><is><t>{value}</t></is></c>')
+    sheet = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+      <sheetData><row r="1">{''.join(header_cells)}</row><row r="2">{''.join(row_cells)}</row></sheetData>
+    </worksheet>"""
+
+    buffer = BytesIO()
+    with ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/worksheets/sheet1.xml", sheet)
+    return buffer.getvalue()
+
+
 class GofoQueryHelperTests(unittest.TestCase):
     def test_build_gofo_download_path_uses_date_platform_and_tracking_number(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -72,11 +116,44 @@ class GofoQueryHelperTests(unittest.TestCase):
             self.assertEqual(directory, base / "tracking-downloads" / "2026-06-09" / "gofo")
             self.assertEqual(target.name, "GFUS01055496346945-gofo-summary.xlsx")
 
+    def test_build_gofo_download_dir_does_not_render_none_as_directory_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = build_gofo_download_dir(base_dir=Path(temp_dir), day_text=None)
+        self.assertNotIn("None", str(directory))
+
     def test_parse_gofo_export_summary_xlsx_reads_current_status(self):
         payload = _build_xlsx_bytes(
             ["Tracking Number", "Waybill No", "Current status", "Last Event"],
             ["OBS0822606080XV1198082", "GFUS01055496346945", "Transit", "2026/06/08 14:34:35 Arrived at GOFO Regional Hub"],
         )
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx") as temp_file:
+            temp_file.write(payload)
+            temp_file.flush()
+            row = parse_gofo_export_summary_xlsx(Path(temp_file.name))
+
+        self.assertEqual(row["Current status"], "Transit")
+        self.assertEqual(row["Waybill No"], "GFUS01055496346945")
+
+    def test_parse_gofo_export_summary_xlsx_reads_inline_string_cells(self):
+        payload = _build_inline_str_xlsx_bytes(
+            ["Tracking Number", "Waybill No", "Current status", "Last Event"],
+            ["OBS0822606080XV1198082", "GFUS01055496346945", "Transit", "2026/06/08 14:34:35 Arrived at GOFO Regional Hub"],
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx") as temp_file:
+            temp_file.write(payload)
+            temp_file.flush()
+            row = parse_gofo_export_summary_xlsx(Path(temp_file.name))
+
+        self.assertEqual(row["Current status"], "Transit")
+        self.assertEqual(row["Waybill No"], "GFUS01055496346945")
+
+    def test_parse_gofo_export_summary_xlsx_reads_csv_payload_disguised_as_xlsx(self):
+        payload = (
+            "\ufeffTracking Number,Waybill No,Current status,Last Event\r\n"
+            "\"OBS0822606080XV1198082\",\"GFUS01055496346945\",\"Transit\",\"2026/06/08 14:34:35 Arrived at GOFO Regional Hub\"\r\n"
+        ).encode("utf-8")
 
         with tempfile.NamedTemporaryFile(suffix=".xlsx") as temp_file:
             temp_file.write(payload)

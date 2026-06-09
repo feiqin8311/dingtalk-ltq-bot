@@ -48,7 +48,6 @@ _TRACK_QUERY_MAX_ATTEMPTS = 3
 _TRACK_QUERY_RETRY_DELAY_SECONDS = 2
 _SERIAL_BROWSER_TRACKING_PLATFORMS = {'agl', 'pingyi', 'baosen', '17track'}
 _BUSINESS_MENU_TEXT = (
-    "已重置当前选择。\n"
     "请选择要办理的业务：\n"
     "1. FBA查询\n"
     "2. 跟踪号查询\n\n"
@@ -380,7 +379,9 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                     self.logger.info("查询完成 FBA=%s", fba_code)
                     return
 
-                reply_text += await self._query_tracking_info(order, fba_code)
+                tracking_reply = await self._query_tracking_info(order, fba_code)
+                if tracking_reply:
+                    reply_text += f"\n\n{tracking_reply}"
             else:
                 reply_text = f"❌ 未找到FBA编号 {fba_code} 的记录"
 
@@ -663,13 +664,13 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                     display_query_value,
                     error,
                 )
-                return f"\n\n⚠️ 物流轨迹查询失败: {error}"
+                return f"⚠️ 物流轨迹查询失败: {error}"
             self.logger.info(
                 "轨迹查询结果: 平台=%s 查询值=%s 无轨迹",
                 normalized_platform,
                 display_query_value,
             )
-            return f"\n\n暂无{normalized_platform.upper()}物流轨迹信息"
+            return f"暂无{normalized_platform.upper()}物流轨迹信息"
 
         latest_track = tracks[0]
         self.logger.info(
@@ -683,28 +684,28 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
 
         lines = []
         if display_query_value:
-            lines.append(f"\n\n正在查询物流轨迹({display_query_value})...")
-        lines.append(f"\n📦 最新物流轨迹({normalized_platform}) - 按时间倒序:")
+            lines.append(f"正在查询物流轨迹({display_query_value})...")
+        lines.append(f"📦 最新物流轨迹({normalized_platform}) - 按时间倒序:")
 
         result_source = str(result.get('结果来源', '') or '').strip()
         if result_source:
-            lines.append(f"\n📚 结果来源: {result_source}")
+            lines.append(f"📚 结果来源: {result_source}")
 
         for track in tracks[:5]:
             time_str = str(track.get('时间', '') or '').strip()
             content = str(track.get('内容', '') or track.get('地点', '') or '').strip()
             tracking_no = str(track.get('单号', '') or '').strip()
             if tracking_no and time_str and content:
-                lines.append(f"\n• {time_str} [{tracking_no}]: {content}")
+                lines.append(f"• {time_str} [{tracking_no}]: {content}")
             elif tracking_no and content:
-                lines.append(f"\n• [{tracking_no}] {content}")
+                lines.append(f"• [{tracking_no}] {content}")
             elif time_str and content:
-                lines.append(f"\n• {time_str}: {content}")
+                lines.append(f"• {time_str}: {content}")
             elif content:
-                lines.append(f"\n• {content}")
+                lines.append(f"• {content}")
         if len(tracks) > 5:
-            lines.append(f"\n• ... 仅显示最新5条（共{len(tracks)}条）")
-        return ''.join(lines)
+            lines.append(f"• ... 仅显示最新5条（共{len(tracks)}条）")
+        return '\n'.join(lines)
 
     def _format_order_info(self, order: dict, fba_code: str) -> str:
         """格式化订单信息为文本"""

@@ -20,6 +20,14 @@ class AmazonUsQueryParsingTests(unittest.TestCase):
             "Delivered Tuesday, June 9, 5:23 AM",
         )
 
+    def test_extract_status_title_from_generic_h1(self):
+        html = '<h1 class="other-heading" mdn-text="">Package delayed</h1>'
+
+        self.assertEqual(
+            extract_amazon_us_status_from_html(html),
+            "Package delayed",
+        )
+
     def test_extract_not_found_error_message(self):
         html = """
         <div class="css-1jlcqid" role="alert" aria-describedby="alert-1-children">

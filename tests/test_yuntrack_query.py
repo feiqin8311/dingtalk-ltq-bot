@@ -72,6 +72,11 @@ class YunTrackQueryHelperTests(unittest.TestCase):
             self.assertEqual(directory, base / "tracking-downloads" / "2026-06-09" / "yuntrack")
             self.assertEqual(target.name, "H00RVA0498916385-yuntrack-summary.xlsx")
 
+    def test_build_yuntrack_download_dir_does_not_render_none_as_directory_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = build_yuntrack_download_dir(base_dir=Path(temp_dir), day_text=None)
+        self.assertNotIn("None", str(directory))
+
     def test_parse_yuntrack_export_summary_xlsx_reads_delivery_status(self):
         payload = _build_xlsx_bytes(
             ["Tracking Number", "Delivery Status"],
@@ -84,6 +89,21 @@ class YunTrackQueryHelperTests(unittest.TestCase):
             row = parse_yuntrack_export_summary_xlsx(Path(temp_file.name))
 
         self.assertEqual(row["Delivery Status"], "In transit")
+
+    def test_parse_yuntrack_export_summary_xlsx_reads_csv_payload_disguised_as_xlsx(self):
+        payload = (
+            "\ufeffTracking number,Order Number,Last Mile Tracking,Country,Last Event,Delivery Status,Calendar Days,Working Days,Extracting Scans\r\n"
+            "\"YT2616000701096085\"\t,\"WO103709674526609410\"\t,\"H00RVA0498916385\"\t,\"CN/GB\"\t,"
+            "\"2026-06-09 07:53:12 Shipment information received\"\t,\"Processing\"\t,\"\"\t,\"\"\t,\"false\"\t,\r\n"
+        ).encode("utf-8")
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx") as temp_file:
+            temp_file.write(payload)
+            temp_file.flush()
+            row = parse_yuntrack_export_summary_xlsx(Path(temp_file.name))
+
+        self.assertEqual(row["Delivery Status"], "Processing")
+        self.assertEqual(row["Last Mile Tracking"], "H00RVA0498916385")
 
     def test_parse_yuntrack_export_summary_xlsx_requires_delivery_status(self):
         payload = _build_xlsx_bytes(["Tracking Number"], ["H00RVA0498916385"])
