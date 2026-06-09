@@ -93,6 +93,46 @@ class TrackingModeMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(replies), 1)
         self.assertIn("已重置当前选择", replies[0])
 
+    async def test_reply_one_enters_fba_mode_and_uses_fba_flow(self):
+        handler, _ = self._make_handler()
+        replies = []
+        handler.reply_text = lambda text, incoming_message: replies.append(text)
+        handler._conversation_modes["cid-1"] = "menu"
+
+        with patch.object(handler, "_handle_fba_message", create=True) as fba_mock:
+            await handler._handle_text_message(self._make_message("1"), "1")
+            await handler._handle_text_message(self._make_message("FBA19900H9WP"), "FBA19900H9WP")
+
+        self.assertEqual(handler._conversation_modes["cid-1"], "fba")
+        self.assertTrue(any("FBA查询" in reply for reply in replies))
+        fba_mock.assert_called_once()
+
+    async def test_reply_two_enters_tracking_mode_and_uses_tracking_flow(self):
+        handler, _ = self._make_handler()
+        replies = []
+        handler.reply_text = lambda text, incoming_message: replies.append(text)
+        handler._conversation_modes["cid-1"] = "menu"
+
+        with patch.object(handler, "_handle_tracking_message", create=True) as tracking_mock:
+            await handler._handle_text_message(self._make_message("2"), "2")
+            await handler._handle_text_message(self._make_message("UUS123456789"), "UUS123456789")
+
+        self.assertEqual(handler._conversation_modes["cid-1"], "tracking")
+        self.assertTrue(any("跟踪号查询" in reply for reply in replies))
+        tracking_mock.assert_called_once()
+
+    async def test_menu_state_replays_menu_on_unknown_selection(self):
+        handler, _ = self._make_handler()
+        replies = []
+        handler.reply_text = lambda text, incoming_message: replies.append(text)
+        handler._conversation_modes["cid-1"] = "menu"
+
+        await handler._handle_text_message(self._make_message("abc"), "abc")
+
+        self.assertEqual(handler._conversation_modes["cid-1"], "menu")
+        self.assertEqual(len(replies), 1)
+        self.assertIn("请选择要办理的业务", replies[0])
+
 
 if __name__ == "__main__":
     unittest.main()
