@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 import zipfile
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 from datetime import UTC, datetime
 from html import unescape
 from pathlib import Path
@@ -68,6 +68,25 @@ _DINGTALK_TOKEN_CACHE: dict[str, Any] = {
     'token': '',
     'expires_at': 0.0,
 }
+
+_TRACKING_QUERY_CACHE_TTL_SECONDS = 900
+_TRACKING_QUERY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+SERIAL_BROWSER_TRACKING_PLATFORMS = {
+    'agl',
+    'pingyi',
+    'baosen',
+    '17track',
+    '17track_en',
+    'uniuni',
+    'gofo',
+    'usps',
+    'ups',
+    'yuntrack',
+    'amazon_uk',
+    'swiship_ca',
+    'amazon_us',
+}
+_BROWSER_TRACKING_QUEUE_STATE: dict[int, dict[str, Any]] = {}
 
 
 class BaosenLoginError(RuntimeError):
@@ -750,6 +769,16 @@ def is_local_port_in_use(host: str = LOCAL_CDP_HOST, port: int = LOCAL_CDP_PORT)
         return False
 
 
+def _is_benign_cdp_lock_cleanup_error(entry: Path, exc: OSError) -> bool:
+    if entry.name not in {'SingletonLock', 'SingletonCookie', 'SingletonSocket'}:
+        return False
+    winerror = getattr(exc, 'winerror', None)
+    if winerror in {5, 32, 33, 1920}:
+        return True
+    text = clean_text(exc)
+    return any(keyword in text for keyword in ['WinError 5', 'WinError 32', 'WinError 33', 'WinError 1920'])
+
+
 def cleanup_stale_cdp_profile_locks(user_data_dir: str) -> None:
     profile_dir = Path(user_data_dir)
     stale_entries = [
@@ -766,6 +795,9 @@ def cleanup_stale_cdp_profile_locks(user_data_dir: str) -> None:
         except FileNotFoundError:
             continue
         except OSError as exc:
+            if _is_benign_cdp_lock_cleanup_error(entry, exc):
+                logger.info("清理 CDP 用户目录锁文件跳过: path=%s error=%s", entry, exc)
+                continue
             logger.warning("清理 CDP 用户目录锁文件失败: path=%s error=%s", entry, exc)
 
 
@@ -880,10 +912,53 @@ def end_local_cdp_session(process: subprocess.Popen | None = None) -> None:
     stop_local_cdp_browser(process)
 
 
+async def open_cdp_query_page(browser, *, viewport: dict[str, int] | None = None, force_new_context: bool = False, **context_kwargs):
+    should_create_context = force_new_context or not browser.contexts
+    if should_create_context:
+        if viewport is not None:
+            context_kwargs.setdefault('viewport', viewport)
+        context = await browser.new_context(**context_kwargs)
+    else:
+        context = browser.contexts[0]
+    page = await context.new_page()
+    return context, page, should_create_context
+
+
+async def cleanup_cdp_query_page(page, context, owns_context: bool) -> None:
+    page_url = ''
+    try:
+        page_url = getattr(page, 'url', '') or ''
+    except Exception:
+        page_url = ''
+
+    try:
+        await page.close()
+        logger.info("CDP 查询页已关闭 owns_context=%s url=%s", owns_context, page_url)
+    except Exception as exc:
+        logger.warning("关闭查询页面失败: %s", exc)
+
+    if not owns_context:
+        return
+
+    try:
+        await context.close()
+        logger.info("CDP 查询上下文已关闭 url=%s", page_url)
+    except Exception as exc:
+        logger.warning("关闭查询上下文失败: %s", exc)
+
+
 def stop_local_cdp_browser(process: subprocess.Popen | None = None) -> None:
     if process is not None:
         try:
-            process.terminate()
+            if os.name == 'nt':
+                subprocess.run(
+                    ['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                process.terminate()
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
@@ -908,7 +983,7 @@ def stop_local_cdp_browser(process: subprocess.Popen | None = None) -> None:
     if pid:
         try:
             if os.name == 'nt':
-                subprocess.run(['taskkill', '/F', '/PID', str(pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 subprocess.run(['kill', pid], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
@@ -917,8 +992,13 @@ def stop_local_cdp_browser(process: subprocess.Popen | None = None) -> None:
 
     try:
         if os.name == 'nt':
-            # pkill is not available on Windows
-            pass
+            for port_pid in _find_local_cdp_pids_by_port(LOCAL_CDP_PORT):
+                subprocess.run(
+                    ['taskkill', '/F', '/T', '/PID', str(port_pid)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
         else:
             subprocess.run(
                 ['pkill', '-f', f'remote-debugging-port={LOCAL_CDP_PORT}'],
@@ -928,6 +1008,34 @@ def stop_local_cdp_browser(process: subprocess.Popen | None = None) -> None:
             )
     except Exception as exc:
         logger.warning("按端口停止本地 CDP 进程失败: %s", exc)
+
+
+def _find_local_cdp_pids_by_port(port: int) -> list[str]:
+    if os.name != 'nt':
+        return []
+    try:
+        result = subprocess.run(
+            ['netstat', '-ano'],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return []
+
+    pids: list[str] = []
+    marker = f':{port}'
+    for line in (result.stdout or '').splitlines():
+        normalized = ' '.join(line.split())
+        if marker not in normalized:
+            continue
+        parts = normalized.split(' ')
+        if len(parts) < 5:
+            continue
+        pid = parts[-1].strip()
+        if pid.isdigit() and pid not in pids:
+            pids.append(pid)
+    return pids
 
 
 def _get_playwright_chromium_executable_path() -> str:
@@ -1333,6 +1441,128 @@ def is_usps_blocked_page_html(html: str) -> bool:
     return False
 
 
+def build_usps_query_urls(tracking_no: str) -> list[str]:
+    normalized = normalize_tracking_number(tracking_no)
+    return [f'https://tools.usps.com/tracking/{normalized}']
+
+
+def build_tracking_result_link(platform: str, query_value: str) -> str:
+    normalized_platform = clean_text(platform).upper()
+    normalized_query = normalize_tracking_number(query_value)
+    if not normalized_platform or not normalized_query:
+        return ''
+    if normalized_platform in {'17TRACK', '17TRACK_EN'}:
+        return f'https://t.17track.net/en#nums={quote(normalized_query)}'
+    if normalized_platform == 'UNIUNI':
+        return f'https://www.uniuni.com//tracking#tracking-detail?no={quote(normalized_query)}'
+    if normalized_platform == 'GOFO':
+        return f'https://www.gofo.com/us/track?searchID={quote(normalized_query)}'
+    if normalized_platform == 'USPS':
+        return f'https://tools.usps.com/tracking/{quote(normalized_query)}'
+    if normalized_platform == 'UPS':
+        return f'https://www.ups.com/track?tracknum={quote(normalized_query)}'
+    if normalized_platform == 'YUNTRACK':
+        return f'https://www.yuntrack.com/parcelTracking?id={quote(normalized_query)}'
+    if normalized_platform == 'AMAZON_UK':
+        return f'https://track.amazon.co.uk/tracking/{quote(normalized_query)}?trackingId={quote(normalized_query)}'
+    if normalized_platform == 'SWISHIP_CA':
+        return f'https://www.swiship.com/track?loc=en-US&id={quote(normalized_query)}'
+    if normalized_platform == 'AMAZON_US':
+        return f'https://track.amazon.com/tracking/{quote(normalized_query)}?trackingId={quote(normalized_query)}'
+    return ''
+
+
+def attach_tracking_result_link(result: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
+    link = normalize_optional_text(result.get('物流链接') or result.get('当前URL'))
+    if not link:
+        link = build_tracking_result_link(result.get('平台', ''), result.get('查询值', ''))
+    if link:
+        result['物流链接'] = link
+    return result
+
+
+def get_tracking_query_cache(cache_key: str) -> dict[str, Any] | None:
+    cached = _TRACKING_QUERY_CACHE.get(cache_key)
+    if not cached:
+        return None
+    expires_at, result = cached
+    if time.time() >= expires_at:
+        _TRACKING_QUERY_CACHE.pop(cache_key, None)
+        return None
+    return dict(result)
+
+
+def set_tracking_query_cache(cache_key: str, result: dict[str, Any]) -> None:
+    if not isinstance(result, dict):
+        return
+    if not result.get('物流轨迹'):
+        return
+    if result.get('错误'):
+        return
+    _TRACKING_QUERY_CACHE[cache_key] = (time.time() + _TRACKING_QUERY_CACHE_TTL_SECONDS, dict(result))
+
+
+def _get_browser_tracking_queue_state() -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    state = _BROWSER_TRACKING_QUEUE_STATE.get(loop_id)
+    if state is None or state.get('loop') is not loop:
+        state = {
+            'loop': loop,
+            'lock': asyncio.Lock(),
+            'waiting': 0,
+        }
+        _BROWSER_TRACKING_QUEUE_STATE[loop_id] = state
+    return state
+
+
+async def _resolve_async_result(result):
+    while asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+        result = await result
+    return result
+
+
+async def run_browser_tracking_query_with_queue(platform: str, query_value: str, operation):
+    state = _get_browser_tracking_queue_state()
+    queue_lock = state['lock']
+
+    queued_ahead = state['waiting']
+    if queue_lock.locked():
+        state['waiting'] += 1
+        queued_ahead = state['waiting']
+        logger.info(
+            "浏览器查询队列: 平台=%s 查询值=%s 排队中 queued_ahead=%s",
+            platform,
+            query_value,
+            queued_ahead,
+        )
+
+    await queue_lock.acquire()
+    if queued_ahead:
+        state['waiting'] = max(0, state['waiting'] - 1)
+
+    try:
+        logger.info(
+            "浏览器查询队列: 平台=%s 查询值=%s 开始执行 waiting=%s",
+            platform,
+            query_value,
+            state['waiting'],
+        )
+        result = operation()
+        result = await _resolve_async_result(result)
+        return result
+    finally:
+        queue_lock.release()
+        logger.info(
+            "浏览器查询队列: 平台=%s 查询值=%s 执行结束 remaining_waiting=%s",
+            platform,
+            query_value,
+            state['waiting'],
+        )
+
+
 async def apply_usps_browser_stealth(context, page) -> None:
     try:
         await context.set_extra_http_headers(
@@ -1706,9 +1936,10 @@ async def query_17track(order_no: str) -> dict[str, Any]:
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        contexts = browser.contexts
-        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
-        page = await context.new_page()
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            viewport={'width': 1440, 'height': 900},
+        )
 
         try:
             await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
@@ -1763,10 +1994,7 @@ async def query_17track(order_no: str) -> dict[str, Any]:
                 '物流轨迹': track_items,
             }
         finally:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+            await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
 
 
@@ -2559,23 +2787,34 @@ def decide_tracking_platform(tracking_no: str) -> str:
 async def query_tracking_number(tracking_no: str) -> dict[str, Any]:
     normalized = normalize_tracking_number(tracking_no)
     platform = decide_tracking_platform(normalized)
+    cache_key = f'{platform}:{normalized}'
+    cached_result = get_tracking_query_cache(cache_key)
+    if cached_result is not None:
+        logger.info("轨迹查询缓存命中: 平台=%s 查询值=%s", platform, normalized)
+        return attach_tracking_result_link(cached_result)
+
     if platform == 'uniuni':
-        return await query_uniuni_tracking(normalized)
-    if platform == 'gofo':
-        return await query_gofo_tracking(normalized)
-    if platform == 'usps':
-        return await query_usps_tracking(normalized)
-    if platform == 'ups':
-        return await query_ups_tracking(normalized)
-    if platform == 'yuntrack':
-        return await query_yuntrack_tracking(normalized)
-    if platform == 'amazon_uk':
-        return await query_amazon_uk_tracking(normalized)
-    if platform == 'swiship_ca':
-        return await query_swiship_tracking(normalized)
-    if platform == 'amazon_us':
-        return await query_amazon_us_tracking(normalized)
-    return await query_17track(normalized)
+        result = await query_uniuni_tracking(normalized)
+    elif platform == 'gofo':
+        result = await query_gofo_tracking(normalized)
+    elif platform == 'usps':
+        result = await query_usps_tracking(normalized)
+    elif platform == 'ups':
+        result = await query_ups_tracking(normalized)
+    elif platform == 'yuntrack':
+        result = await query_yuntrack_tracking(normalized)
+    elif platform == 'amazon_uk':
+        result = await query_amazon_uk_tracking(normalized)
+    elif platform == 'swiship_ca':
+        result = await query_swiship_tracking(normalized)
+    elif platform == 'amazon_us':
+        result = await query_amazon_us_tracking(normalized)
+    else:
+        result = await query_17track(normalized)
+
+    result = attach_tracking_result_link(result)
+    set_tracking_query_cache(cache_key, result)
+    return result
 
 
 def build_gofo_download_dir(base_dir: Path | None = None, day_text: str | None = None) -> Path:
@@ -2726,9 +2965,10 @@ async def query_uniuni_tracking(tracking_no: str) -> dict[str, Any]:
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        contexts = browser.contexts
-        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
-        page = await context.new_page()
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            viewport={'width': 1440, 'height': 900},
+        )
 
         try:
             await apply_usps_browser_stealth(context, page)
@@ -2813,7 +3053,7 @@ async def query_uniuni_tracking(tracking_no: str) -> dict[str, Any]:
                 '调试HTML': html_path,
             }
         finally:
-            await page.close()
+            await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
 
 
@@ -2828,9 +3068,10 @@ async def query_gofo_tracking(tracking_no: str) -> dict[str, Any]:
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        contexts = browser.contexts
-        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
-        page = await context.new_page()
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            viewport={'width': 1440, 'height': 900},
+        )
 
         try:
             async def _dump_debug_artifacts() -> tuple[str, str, str]:
@@ -2981,7 +3222,7 @@ async def query_gofo_tracking(tracking_no: str) -> dict[str, Any]:
                 '最新轨迹': latest_track,
             }
         finally:
-            await page.close()
+            await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
 
 
@@ -2990,13 +3231,16 @@ async def query_usps_tracking(tracking_no: str) -> dict[str, Any]:
     from playwright.async_api import async_playwright
 
     normalized = normalize_tracking_number(tracking_no)
-    query_url = f'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1={normalized}'
+    query_urls = build_usps_query_urls(normalized)
+    home_url = 'https://tools.usps.com/tracking/'
     logger.info("USPS 查询: tracking_no=%s", normalized)
 
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        context = await browser.new_context(
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            force_new_context=True,
             viewport={'width': 1440, 'height': 900},
             user_agent=(
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -3007,18 +3251,6 @@ async def query_usps_tracking(tracking_no: str) -> dict[str, Any]:
             timezone_id='America/Chicago',
             color_scheme='light',
         )
-        host_page = None
-        for existing_context in browser.contexts:
-            try:
-                if existing_context.pages:
-                    candidate = existing_context.pages[0]
-                    candidate_url = candidate.url or ''
-                    if candidate_url in {'', 'about:blank'}:
-                        host_page = candidate
-                        break
-            except Exception:
-                continue
-        page = host_page or await context.new_page()
 
         try:
             await apply_usps_browser_stealth(context, page)
@@ -3026,6 +3258,62 @@ async def query_usps_tracking(tracking_no: str) -> dict[str, Any]:
                 await page.bring_to_front()
             except Exception:
                 pass
+
+            async def _wait_for_usps_tracking_input() -> None:
+                search_input = page.locator('#tracking-input').first
+                try:
+                    await search_input.wait_for(timeout=12000)
+                    return
+                except Exception as exc:
+                    html = await page.content()
+                    if not is_usps_blocked_page_html(html):
+                        raise exc
+
+                    logger.warning("USPS 查询: 检测到 Akamai 挑战页，等待自动恢复 tracking_no=%s", normalized)
+                    await page.wait_for_timeout(random.randint(5000, 9000))
+                    try:
+                        await search_input.wait_for(timeout=8000)
+                        return
+                    except Exception:
+                        logger.warning("USPS 查询: 挑战页未自动恢复，尝试刷新 tracking_no=%s", normalized)
+                        await page.reload(wait_until='domcontentloaded', timeout=60000)
+                        await page.wait_for_timeout(random.randint(3000, 6000))
+                        await search_input.wait_for(timeout=12000)
+
+            search_submitted = False
+            submit_error = ''
+
+            try:
+                logger.info("USPS 查询: 打开查询页 %s", home_url)
+                await page.goto(home_url, wait_until='domcontentloaded', timeout=60000)
+                search_input = page.locator('#tracking-input').first
+                await _wait_for_usps_tracking_input()
+                await page.wait_for_timeout(random.randint(600, 1300))
+                await _type_like_human(page, '#tracking-input', normalized, delay_range=(90, 180))
+                await page.wait_for_timeout(random.randint(500, 1100))
+                actual_input_value = normalize_tracking_number(await search_input.input_value())
+                if actual_input_value != normalized:
+                    raise RuntimeError(
+                        f'USPS 输入框内容被截断或改写: expected={normalized} actual={actual_input_value or "empty"}'
+                    )
+
+                search_button = page.locator('#trackBtn').first
+                await search_button.wait_for(timeout=10000)
+                await page.wait_for_timeout(random.randint(400, 900))
+                await search_button.click(timeout=10000)
+                tracking_number = page.locator('#trackingNum').first
+                await tracking_number.wait_for(timeout=30000)
+                tracking_number_text = clean_text(await tracking_number.inner_text())
+                if tracking_number_text != normalized:
+                    raise RuntimeError(
+                        f'USPS 查询结果页跟踪号不匹配: expected={normalized} actual={tracking_number_text or "empty"}'
+                    )
+                await page.wait_for_timeout(random.randint(1800, 3200))
+                search_submitted = True
+            except Exception as exc:
+                submit_error = str(exc)
+                logger.warning("USPS 查询: 提交查询失败 tracking_no=%s error=%s", normalized, exc)
+
             async def _dump_debug_artifacts() -> tuple[str, str, str]:
                 title = ''
                 url = page.url
@@ -3053,47 +3341,52 @@ async def query_usps_tracking(tracking_no: str) -> dict[str, Any]:
                 )
                 return title, url, str(html_path)
 
-            for attempt in range(1, 4):
-                if attempt == 1:
+            if not search_submitted:
+                title, current_url, html_path = await _dump_debug_artifacts()
+                return {
+                    '平台': 'USPS',
+                    '查询值': normalized,
+                    '物流轨迹': [],
+                    '最新轨迹': {},
+                    '错误': f'USPS 查询提交失败: {submit_error or "未知错误"}',
+                    '当前页面标题': title,
+                    '当前URL': current_url,
+                    '调试HTML': html_path,
+                }
+
+            for query_url in query_urls:
+                for attempt in range(1, 4):
+                    if attempt == 1:
+                        logger.info("USPS 查询: 已提交 tracking_no=%s target=%s", normalized, query_url)
+                    else:
+                        logger.warning(
+                            "USPS 查询: 页面未返回轨迹，刷新重试 tracking_no=%s url=%s attempt=%s",
+                            normalized,
+                            query_url,
+                            attempt - 1,
+                        )
+                        await page.reload(wait_until='domcontentloaded', timeout=60000)
                     try:
-                        await page.goto('https://tools.usps.com/', wait_until='domcontentloaded', timeout=60000)
-                        await page.wait_for_timeout(2500)
-                    except Exception:
+                        await page.wait_for_load_state('networkidle', timeout=20000)
+                    except PlaywrightTimeoutError:
                         pass
-                    await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
-                else:
-                    logger.warning("USPS 查询: 页面未返回轨迹，刷新重试 tracking_no=%s attempt=%s", normalized, attempt - 1)
-                    await page.reload(wait_until='domcontentloaded', timeout=60000)
-                try:
-                    await page.wait_for_load_state('networkidle', timeout=20000)
-                except PlaywrightTimeoutError:
-                    pass
-                await page.wait_for_timeout(8000 + attempt * 3000)
-                try:
-                    await page.wait_for_selector('div.tb-step, p.tb-status, p.tb-status-detail', timeout=45000)
-                except PlaywrightTimeoutError:
-                    await page.wait_for_timeout(5000)
-                html = await page.content()
-                if is_usps_blocked_page_html(html):
-                    title, current_url, html_path = await _dump_debug_artifacts()
-                    return {
-                        '平台': 'USPS',
-                        '查询值': normalized,
-                        '物流轨迹': [],
-                        '最新轨迹': {},
-                        '错误': 'USPS 官网触发风控拦截，页面返回空白校验页',
-                        '当前页面标题': title,
-                        '当前URL': current_url,
-                        '调试HTML': html_path,
-                    }
-                items = extract_usps_tracking_items_from_html(html)
-                if items:
-                    return {
-                        '平台': 'USPS',
-                        '查询值': normalized,
-                        '物流轨迹': items,
-                        '最新轨迹': items[0],
-                    }
+                    await page.wait_for_timeout(4000 + attempt * 2000)
+                    try:
+                        await page.wait_for_selector('div.tb-step, p.tb-status, p.tb-status-detail', timeout=45000)
+                    except PlaywrightTimeoutError:
+                        await page.wait_for_timeout(3000)
+                    html = await page.content()
+                    items = extract_usps_tracking_items_from_html(html)
+                    if items:
+                        return {
+                            '平台': 'USPS',
+                            '查询值': normalized,
+                            '物流轨迹': items,
+                            '最新轨迹': items[0],
+                        }
+                    if is_usps_blocked_page_html(html):
+                        logger.warning("USPS 查询: 检测到风控中间页 tracking_no=%s url=%s", normalized, query_url)
+                        break
 
             title, current_url, html_path = await _dump_debug_artifacts()
             return {
@@ -3101,14 +3394,13 @@ async def query_usps_tracking(tracking_no: str) -> dict[str, Any]:
                 '查询值': normalized,
                 '物流轨迹': [],
                 '最新轨迹': {},
-                '错误': 'USPS 页面未返回轨迹信息',
+                '错误': 'USPS 官网触发风控拦截或页面未返回轨迹信息',
                 '当前页面标题': title,
                 '当前URL': current_url,
                 '调试HTML': html_path,
             }
         finally:
-            if host_page is None:
-                await page.close()
+            await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
 
 
@@ -3123,9 +3415,10 @@ async def query_ups_tracking(tracking_no: str) -> dict[str, Any]:
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        contexts = browser.contexts
-        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
-        page = await context.new_page()
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            viewport={'width': 1440, 'height': 900},
+        )
 
         try:
             for attempt in range(1, 4):
@@ -3162,7 +3455,7 @@ async def query_ups_tracking(tracking_no: str) -> dict[str, Any]:
                 '错误': 'UPS 页面未返回当前物流状态',
             }
         finally:
-            await page.close()
+            await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
 
 
@@ -3177,9 +3470,10 @@ async def query_yuntrack_tracking(tracking_no: str) -> dict[str, Any]:
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        contexts = browser.contexts
-        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
-        page = await context.new_page()
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            viewport={'width': 1440, 'height': 900},
+        )
 
         try:
             await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
@@ -3254,7 +3548,7 @@ async def query_yuntrack_tracking(tracking_no: str) -> dict[str, Any]:
                 '最新轨迹': latest_track,
             }
         finally:
-            await page.close()
+            await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
 
 
@@ -3269,9 +3563,10 @@ async def query_amazon_uk_tracking(tracking_no: str) -> dict[str, Any]:
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        contexts = browser.contexts
-        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
-        page = await context.new_page()
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            viewport={'width': 1440, 'height': 900},
+        )
 
         try:
             async def _dump_debug_artifacts() -> tuple[str, str, str]:
@@ -3407,7 +3702,7 @@ async def query_amazon_uk_tracking(tracking_no: str) -> dict[str, Any]:
                 '调试HTML': html_path,
             }
         finally:
-            await page.close()
+            await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
 
 
@@ -3421,9 +3716,10 @@ async def query_swiship_tracking(tracking_no: str) -> dict[str, Any]:
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        contexts = browser.contexts
-        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
-        page = await context.new_page()
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            viewport={'width': 1440, 'height': 900},
+        )
 
         try:
             await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
@@ -3450,7 +3746,7 @@ async def query_swiship_tracking(tracking_no: str) -> dict[str, Any]:
                 '最新轨迹': items[0] if items else {},
             }
         finally:
-            await page.close()
+            await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
 
 
@@ -3466,9 +3762,10 @@ async def query_amazon_us_tracking(tracking_no: str) -> dict[str, Any]:
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        contexts = browser.contexts
-        context = contexts[0] if contexts else await browser.new_context(viewport={'width': 1440, 'height': 900})
-        page = await context.new_page()
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            viewport={'width': 1440, 'height': 900},
+        )
 
         try:
             async def _read_status_from_current_page() -> tuple[str, str]:
@@ -3599,7 +3896,7 @@ async def query_amazon_us_tracking(tracking_no: str) -> dict[str, Any]:
                 '最新轨迹': latest_track,
             }
         finally:
-            await page.close()
+            await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
 
 

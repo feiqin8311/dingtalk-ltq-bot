@@ -6,7 +6,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from logistics_query import (
+    SERIAL_BROWSER_TRACKING_PLATFORMS,
+    attach_tracking_result_link,
     decide_platform,
+    decide_tracking_platform,
     find_order_by_fba,
     get_primary_logistics_no,
     query_17track,
@@ -15,6 +18,7 @@ from logistics_query import (
     query_meitong,
     query_pingyi,
     query_tracking_number,
+    run_browser_tracking_query_with_queue,
 )
 from qq_query import query_qq
 
@@ -81,15 +85,31 @@ async def _query_fba_tracking_result(order: dict[str, Any], fba_code: str, expli
     if platform == "meitong":
         return await asyncio.to_thread(query_meitong, tracking_no)
     if platform == "agl":
-        return await asyncio.to_thread(query_agl, tracking_no, order, False)
+        return await run_browser_tracking_query_with_queue(
+            platform="AGL",
+            query_value=tracking_no,
+            operation=lambda: asyncio.to_thread(query_agl, tracking_no, order, False),
+        )
     if platform == "pingyi":
-        return await query_pingyi(fba_code)
+        return await run_browser_tracking_query_with_queue(
+            platform="PINGYI",
+            query_value=fba_code,
+            operation=lambda: query_pingyi(fba_code),
+        )
     if platform == "baosen":
-        return await query_baosen(tracking_no)
+        return await run_browser_tracking_query_with_queue(
+            platform="BAOSEN",
+            query_value=tracking_no,
+            operation=lambda: query_baosen(tracking_no),
+        )
     if platform == "qq":
         return await asyncio.to_thread(query_qq, order, tracking_no)
     if platform == "17track":
-        return await query_17track(tracking_no)
+        return await run_browser_tracking_query_with_queue(
+            platform="17TRACK",
+            query_value=tracking_no,
+            operation=lambda: query_17track(tracking_no),
+        )
     return None
 
 
@@ -109,7 +129,17 @@ async def health() -> dict[str, Any]:
     dependencies=[Depends(validate_api_key)],
 )
 async def query_tracking(payload: TrackingQueryRequest) -> dict[str, Any]:
-    result = await query_tracking_number(payload.tracking_no)
+    platform = decide_tracking_platform(payload.tracking_no)
+    if platform in SERIAL_BROWSER_TRACKING_PLATFORMS:
+        result = await run_browser_tracking_query_with_queue(
+            platform=platform.upper(),
+            query_value=payload.tracking_no,
+            operation=lambda: query_tracking_number(payload.tracking_no),
+        )
+    else:
+        result = await query_tracking_number(payload.tracking_no)
+
+    result = attach_tracking_result_link(result)
     error = str(result.get("错误", "") or "").strip()
     if error:
         return build_api_response(success=False, data=result, error=error)

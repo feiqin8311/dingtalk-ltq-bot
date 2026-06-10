@@ -101,6 +101,30 @@ class CdpSessionLifecycleTests(unittest.TestCase):
         finally:
             logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = original_count
 
+
+class CdpProfileCleanupTests(unittest.TestCase):
+    def test_benign_windows_singleton_lock_error_is_ignored(self):
+        exc = PermissionError("[WinError 1920] 系统无法访问此文件。")
+        exc.winerror = 1920
+
+        self.assertTrue(
+            logistics_query._is_benign_cdp_lock_cleanup_error(Path("SingletonLock"), exc)
+        )
+        self.assertTrue(
+            logistics_query._is_benign_cdp_lock_cleanup_error(Path("SingletonCookie"), exc)
+        )
+        self.assertTrue(
+            logistics_query._is_benign_cdp_lock_cleanup_error(Path("SingletonSocket"), exc)
+        )
+
+    def test_non_singleton_cleanup_error_is_not_ignored(self):
+        exc = PermissionError("[WinError 1920] 系统无法访问此文件。")
+        exc.winerror = 1920
+
+        self.assertFalse(
+            logistics_query._is_benign_cdp_lock_cleanup_error(Path("Preferences"), exc)
+        )
+
     def test_ensure_local_cdp_browser_binds_debugging_address(self):
         calls = [False, True]
         popen_mock = mock.Mock()
@@ -155,6 +179,25 @@ class CdpSessionLifecycleTests(unittest.TestCase):
                 self.assertEqual(logistics_query._LOCAL_CDP_ACTIVE_SESSIONS, 0)
         finally:
             logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = original_count
+
+    def test_stop_local_cdp_browser_uses_windows_taskkill_tree(self):
+        process = mock.Mock()
+        process.pid = 43210
+        process.wait.side_effect = logistics_query.subprocess.TimeoutExpired(cmd="chrome", timeout=5)
+        process.kill = mock.Mock()
+
+        with mock.patch.object(logistics_query.os, "name", "nt"), \
+             mock.patch.object(logistics_query, "LOCAL_CDP_HOST", "127.0.0.1"), \
+             mock.patch.object(logistics_query, "_find_local_cdp_pids_by_port", return_value=[]), \
+             mock.patch.object(logistics_query.subprocess, "run") as run_mock:
+            logistics_query.stop_local_cdp_browser(process)
+
+        run_mock.assert_any_call(
+            ["taskkill", "/F", "/T", "/PID", "43210"],
+            check=False,
+            stdout=logistics_query.subprocess.DEVNULL,
+            stderr=logistics_query.subprocess.DEVNULL,
+        )
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from gewechat_client import GEWECHAT_CALLBACK_EVENTS_PATH, get_gewechat_client
+from integrations.gewechat.client import GEWECHAT_CALLBACK_EVENTS_PATH, get_gewechat_client
 
 
 logger = logging.getLogger(__name__)

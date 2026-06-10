@@ -2,6 +2,7 @@ import os
 import sys
 import types
 import unittest
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 
@@ -45,9 +46,13 @@ class ApiServerTests(unittest.IsolatedAsyncioTestCase):
             "查询值": "UUS123456789",
             "物流轨迹": [{"时间": "2026-06-09 10:00:00", "内容": "Package arrived"}],
             "最新轨迹": {"时间": "2026-06-09 10:00:00", "内容": "Package arrived"},
+            "物流链接": "https://www.uniuni.com//tracking#tracking-detail?no=UUS123456789",
         }
 
-        with patch.object(api_server, "query_tracking_number", new=AsyncMock(return_value=expected)):
+        raw_result = dict(expected)
+        raw_result.pop("物流链接")
+
+        with patch.object(api_server, "query_tracking_number", new=AsyncMock(return_value=raw_result)):
             result = await api_server.query_tracking(payload)
 
         self.assertTrue(result["success"])
@@ -88,6 +93,29 @@ class ApiServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"]["FBA编号"], "FBA123456")
         self.assertEqual(result["data"]["命中平台"], "17track")
         self.assertEqual(result["data"]["物流查询结果"], expected_tracking)
+
+    async def test_api_browser_queries_run_serially(self):
+        api_server = self._load_module()
+        events: list[str] = []
+
+        async def operation(name: str):
+            events.append(f"start:{name}")
+            await asyncio.sleep(0.05)
+            events.append(f"end:{name}")
+            return {
+                "平台": "USPS",
+                "查询值": name,
+                "物流轨迹": [{"时间": "2026-06-09 10:00:00", "内容": name}],
+                "最新轨迹": {"时间": "2026-06-09 10:00:00", "内容": name},
+            }
+
+        with patch.object(api_server, "query_tracking_number", side_effect=lambda tracking_no: operation(tracking_no)):
+            first = asyncio.create_task(api_server.query_tracking(api_server.TrackingQueryRequest(tracking_no="A")))
+            await asyncio.sleep(0.01)
+            second = asyncio.create_task(api_server.query_tracking(api_server.TrackingQueryRequest(tracking_no="B")))
+            await asyncio.gather(first, second)
+
+        self.assertEqual(events, ["start:A", "end:A", "start:B", "end:B"])
 
 
 if __name__ == "__main__":

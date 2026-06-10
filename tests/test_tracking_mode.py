@@ -159,6 +159,7 @@ class TrackingModeMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(replies), 2)
         self.assertIn("开始查询跟踪号 UUS123456789", replies[0])
         self.assertIn("最新物流轨迹", replies[1])
+        self.assertIn("https://www.uniuni.com//tracking#tracking-detail?no=UUS123456789", replies[1])
 
     async def test_tracking_mode_rejects_empty_text(self):
         handler, _ = self._make_handler()

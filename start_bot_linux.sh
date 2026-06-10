@@ -2,4 +2,5 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "$PROJECT_DIR/scripts/linux/stop_host_cdp.sh" "$@"
+cd "$PROJECT_DIR"
+exec bash "$PROJECT_DIR/scripts/linux/start_bot_linux.sh" "$@"

@@ -1,0 +1,1 @@
+"""Gewechat integration package."""

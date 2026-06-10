@@ -16,6 +16,8 @@ __pycache__/
 data/
 runtime/
 tmp/
+node_modules/
+NapCat.Shell/node_modules/
 NapCat.Shell/cache/
 NapCat.Shell/config/
 Thumbs.db

@@ -119,6 +119,38 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events, ["start:A", "end:A", "start:B", "end:B"])
 
+    async def test_usps_queries_run_serially(self):
+        handler, _ = self._make_handler()
+        events: list[str] = []
+
+        async def operation(name: str):
+            events.append(f"start:{name}")
+            await asyncio.sleep(0.05)
+            events.append(f"end:{name}")
+            return {"平台": "USPS", "查询值": name, "物流轨迹": [{"时间": "2026-04-07 10:00:00", "内容": name}]}
+
+        first = asyncio.create_task(
+            handler._run_tracking_query_with_queue(
+                platform="USPS",
+                platform_key="usps",
+                query_value="A",
+                operation=lambda: operation("A"),
+            )
+        )
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(
+            handler._run_tracking_query_with_queue(
+                platform="USPS",
+                platform_key="usps",
+                query_value="B",
+                operation=lambda: operation("B"),
+            )
+        )
+
+        await asyncio.gather(first, second)
+
+        self.assertEqual(events, ["start:A", "end:A", "start:B", "end:B"])
+
     async def test_baosen_login_error_is_not_retried(self):
         handler, _ = self._make_handler()
         attempts = 0

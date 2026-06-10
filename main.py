@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 from logistics_query import (
     BaosenLoginError,
+    SERIAL_BROWSER_TRACKING_PLATFORMS,
+    attach_tracking_result_link,
     query_tracking_number,
     load_env,
     find_order_by_fba,
@@ -28,8 +30,10 @@ from logistics_query import (
     query_baosen,
     query_pingyi,
     decide_platform,
+    decide_tracking_platform,
     get_primary_logistics_no,
     get_dingtalk_access_token,
+    run_browser_tracking_query_with_queue,
 )
 from qq_query import query_qq, send_qq_question
 from wechat_query import get_wechat_provider, query_wechat
@@ -46,7 +50,6 @@ logger = logging.getLogger(__name__)
 _MESSAGE_DEDUP_TTL_SECONDS = 300
 _TRACK_QUERY_MAX_ATTEMPTS = 3
 _TRACK_QUERY_RETRY_DELAY_SECONDS = 2
-_SERIAL_BROWSER_TRACKING_PLATFORMS = {'agl', 'pingyi', 'baosen', '17track'}
 _BUSINESS_MENU_TEXT = (
     "请选择要办理的业务：\n"
     "1. FBA查询\n"
@@ -398,7 +401,15 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
             self.reply_text("请发送要查询的跟踪号", incoming_message)
             return
         self.reply_text(f"收到，开始查询跟踪号 {tracking_no} ...", incoming_message)
-        result = await query_tracking_number(tracking_no)
+        platform_key = decide_tracking_platform(tracking_no)
+        if platform_key in SERIAL_BROWSER_TRACKING_PLATFORMS:
+            result = await run_browser_tracking_query_with_queue(
+                platform=platform_key.upper(),
+                query_value=tracking_no,
+                operation=lambda: query_tracking_number(tracking_no),
+            )
+        else:
+            result = await query_tracking_number(tracking_no)
         reply_text = self._format_tracking_result(result, 'tracking')
         if reply_text:
             self.reply_text(reply_text, incoming_message)
@@ -642,6 +653,8 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         )
 
     def _format_tracking_result(self, result: dict, platform: str, query_value: str | None = None) -> str:
+        if platform == 'tracking':
+            result = attach_tracking_result_link(result)
         normalized_platform = str(result.get('平台', platform) or platform).strip()
         display_query_value = (query_value or result.get('查询值') or '').strip()
         tracks = _deduplicate_tracks(
@@ -690,6 +703,10 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         result_source = str(result.get('结果来源', '') or '').strip()
         if result_source:
             lines.append(f"📚 结果来源: {result_source}")
+
+        tracking_link = str(result.get('物流链接', '') or '').strip()
+        if platform == 'tracking' and tracking_link:
+            lines.append(f"🔗 物流详情: {tracking_link}")
 
         for track in tracks[:5]:
             time_str = str(track.get('时间', '') or '').strip()
@@ -844,40 +861,14 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         return self._format_tracking_result(result, platform, query_value=query_value)
 
     async def _run_tracking_query_with_queue(self, platform: str, platform_key: str, query_value: str, operation):
-        if platform_key not in _SERIAL_BROWSER_TRACKING_PLATFORMS:
+        if platform_key not in SERIAL_BROWSER_TRACKING_PLATFORMS:
             return await self._run_tracking_query_with_retry(platform, query_value, operation)
 
-        queued_ahead = self._browser_queue_waiting
-        if self._browser_query_lock.locked():
-            self._browser_queue_waiting += 1
-            queued_ahead = self._browser_queue_waiting
-            self.logger.info(
-                "轨迹查询队列: 平台=%s 查询值=%s 排队中 queued_ahead=%s",
-                platform,
-                query_value,
-                queued_ahead,
-            )
-
-        await self._browser_query_lock.acquire()
-        if queued_ahead:
-            self._browser_queue_waiting = max(0, self._browser_queue_waiting - 1)
-
-        try:
-            self.logger.info(
-                "轨迹查询队列: 平台=%s 查询值=%s 开始执行 waiting=%s",
-                platform,
-                query_value,
-                self._browser_queue_waiting,
-            )
-            return await self._run_tracking_query_with_retry(platform, query_value, operation)
-        finally:
-            self._browser_query_lock.release()
-            self.logger.info(
-                "轨迹查询队列: 平台=%s 查询值=%s 执行结束 remaining_waiting=%s",
-                platform,
-                query_value,
-                self._browser_queue_waiting,
-            )
+        return await run_browser_tracking_query_with_queue(
+            platform=platform,
+            query_value=query_value,
+            operation=lambda: self._run_tracking_query_with_retry(platform, query_value, operation),
+        )
 
     async def _run_qq_query_with_queue(self, platform: str, query_value: str, operation):
         queued_ahead = self._qq_queue_waiting

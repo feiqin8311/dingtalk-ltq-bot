@@ -119,9 +119,11 @@
 6. NapCat HTTP 服务启动后执行:
    - `python scripts\setup_qq_route.py --write-env`
 7. 只启动机器人:
-   - `.\start_bot.ps1`
+   - `.\scripts\windows\start_bot.ps1`
+   - 兼容入口: `.\start_bot.ps1`
 8. 启动 NapCatQQ 并启动机器人:
-   - `.\start_all.ps1`
+   - `.\scripts\windows\start_all.ps1`
+   - 兼容入口: `.\start_all.ps1`
 
 ## 17TRACK
 1. 当前只配置了 `大黄蜂`。
@@ -209,22 +211,42 @@
    - 确认 `.env` 中 `QQ_API_BASE_URL` 和 `QQ_API_TOKEN`
    - 执行 `conda run -n dingtalk-ltq-bot python scripts/setup_qq_route.py --write-env`
 5. 启动机器人:
-   - `conda run -n dingtalk-ltq-bot bash start_bot.sh`
+   - `conda run -n dingtalk-ltq-bot bash scripts/linux/start_bot.sh`
+   - 兼容入口: `conda run -n dingtalk-ltq-bot bash start_bot.sh`
 6. 如果只想单独测试本地 CDP Chrome:
-   - `bash start_host_cdp.sh 19444 visible`
+   - `bash scripts/linux/start_host_cdp.sh 19444 visible`
+   - 兼容入口: `bash start_host_cdp.sh 19444 visible`
+
+## 双平台运行约定
+- 统一本地 API 端口: `18081`
+- 统一本地 CDP 端口: `19444`
+- Windows 配置模板: `.env.windows.example`
+- Linux / WSL 配置模板: `.env.linux.example`
+- Windows 启动脚本会优先读取 `.env.windows`，再回退到 `.env`
+- Linux / WSL 启动脚本会优先读取 `.env.linux`，再回退到 `.env`
+- Windows API 启动: `.\scripts\windows\start_api.ps1`
+- Linux / WSL API 启动: `bash ./scripts/linux/start_api.sh`
+- Linux / WSL 机器人启动: `bash ./scripts/linux/start_bot_linux.sh`
+- 根目录旧脚本保留为兼容壳，后续统一使用 `scripts/` 下的新路径
+- Windows 主执行环境继续优先承载 `QQ / NapCat / Windows Playwright` 相关能力。
+- Linux / WSL 执行环境用于兼容运行 API、浏览器查询和无 Windows 桌面依赖的平台。
 
 ## 公网 API 网关方案
 - 推荐架构:
   - 阿里云服务器只部署 Docker 网关
   - 本机继续运行 `api_server.py` 和浏览器自动化查询
-  - 本机通过反向 SSH 隧道把 `127.0.0.1:8000` 转发到云主机 `127.0.0.1:18781`
-  - Docker 网关再把公网请求转发到这个云主机本地隧道端口
+  - 优先通过 Tailscale 让服务器直连本机 API
+  - 反向 SSH 隧道仅作为备用链路，把 `127.0.0.1:18081` 转发到云主机 `127.0.0.1:18781`
+  - Docker 网关优先转发到 Tailscale 上游，必要时再切回本地隧道端口
+- 网关修改 `deploy/gateway/.env` 后，必须执行
+  `docker compose --env-file deploy/gateway/.env -f deploy/docker-compose.gateway.yml up -d --force-recreate --no-build logistics-query-gateway`
+  才会让新上游地址进入容器环境。
 - 参考文档:
   - `docs/deployment-public-api-gateway.md`
 - 关键端口:
   - 公网网关: `18743`
   - 云主机本地隧道: `18781`
-  - 本机 API: `8000`
+  - 本机 API: `18081`
 
 ## 当前代码里的真实平台枚举
 - `auto`

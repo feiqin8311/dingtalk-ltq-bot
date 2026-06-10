@@ -4,4 +4,4 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
-exec python3 "$PROJECT_DIR/main.py"
+exec bash "$PROJECT_DIR/scripts/linux/start_bot.sh" "$@"
