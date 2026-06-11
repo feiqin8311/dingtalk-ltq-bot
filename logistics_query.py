@@ -1461,6 +1461,8 @@ def build_tracking_result_link(platform: str, query_value: str) -> str:
         return f'https://tools.usps.com/tracking/{quote(normalized_query)}'
     if normalized_platform == 'UPS':
         return f'https://www.ups.com/track?tracknum={quote(normalized_query)}'
+    if normalized_platform == 'FEDEX':
+        return f'https://www.fedex.com/wtrk/track/?trknbr={quote(normalized_query)}'
     if normalized_platform == 'YUNTRACK':
         return f'https://www.yuntrack.com/parcelTracking?id={quote(normalized_query)}'
     if normalized_platform == 'AMAZON_UK':
@@ -1933,42 +1935,83 @@ async def query_17track(order_no: str) -> dict[str, Any]:
         body_text = clean_text(body_text)
         return any(pattern in body_text for pattern in text_patterns)
 
+    async def detect_not_found_result(page) -> str:
+        text_patterns = [
+            'Not found',
+            'Tracking Not Available',
+            'The carrier has not updated the information',
+            'try switching carrier and then check again',
+        ]
+
+        try:
+            html = await page.content()
+        except Exception:
+            html = ''
+        normalized_html = clean_text(html)
+        if all(pattern.lower() in normalized_html.lower() for pattern in ('not found', 'carrier has not updated the information')):
+            return '17TRACK 未查询到轨迹信息，请确认单号或切换承运商后重试'
+        if 'Tracking Not Available'.lower() in normalized_html.lower():
+            return '17TRACK 未查询到轨迹信息，请确认单号是否有效'
+
+        try:
+            body_text = await page.locator('body').inner_text(timeout=1000)
+        except Exception:
+            body_text = ''
+        normalized_body_text = clean_text(body_text).lower()
+        for pattern in text_patterns:
+            if pattern.lower() in normalized_body_text:
+                return '17TRACK 未查询到轨迹信息，请确认单号或切换承运商后重试'
+        return ''
+
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
         context, page, owns_context = await open_cdp_query_page(
             browser,
+            force_new_context=True,
             viewport={'width': 1440, 'height': 900},
         )
 
         try:
             await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(1200)
             await dismiss_17track_guide_popup(page)
 
             captcha_detected = False
             timeline_root = page.locator('span.yq-time').first
-            for _ in range(300):
+            for _ in range(180):
                 await dismiss_17track_guide_popup(page)
                 if await detect_human_verification(page):
                     if not captcha_detected:
                         captcha_detected = True
                         logger.warning("17TRACK 查询: 检测到人机验证，请先在浏览器中完成验证，程序将继续等待")
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(800)
                     continue
+
+                not_found_error = await detect_not_found_result(page)
+                if not_found_error:
+                    return {
+                        '平台': '17TRACK',
+                        '查询值': normalized,
+                        '当前页面标题': await page.title(),
+                        '当前URL': page.url,
+                        '最新轨迹': {},
+                        '物流轨迹': [],
+                        '错误': not_found_error,
+                    }
 
                 try:
                     if await timeline_root.count() > 0 and await timeline_root.is_visible(timeout=300):
                         break
                 except Exception:
                     pass
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(700)
             else:
                 if captcha_detected:
                     raise RuntimeError('17TRACK 人机验证等待超时，请完成验证后重试')
                 raise RuntimeError('17TRACK 查询超时，未获取到轨迹结果')
 
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(800)
 
             timeline_container = page.locator('span.yq-time').locator('xpath=ancestor::div[contains(@class,"relative")][1]').first
             html = await timeline_container.inner_html(timeout=15000)
@@ -2769,6 +2812,8 @@ def decide_tracking_platform(tracking_no: str) -> str:
         return 'uniuni'
     if normalized.startswith('GFUS'):
         return 'gofo'
+    if normalized.startswith('38'):
+        return 'fedex'
     if normalized.startswith('9'):
         return 'usps'
     if normalized.startswith('1Z0'):
@@ -2797,6 +2842,8 @@ async def query_tracking_number(tracking_no: str) -> dict[str, Any]:
         result = await query_uniuni_tracking(normalized)
     elif platform == 'gofo':
         result = await query_gofo_tracking(normalized)
+    elif platform == 'fedex':
+        result = await query_fedex_tracking(normalized)
     elif platform == 'usps':
         result = await query_usps_tracking(normalized)
     elif platform == 'ups':
@@ -2815,6 +2862,87 @@ async def query_tracking_number(tracking_no: str) -> dict[str, Any]:
     result = attach_tracking_result_link(result)
     set_tracking_query_cache(cache_key, result)
     return result
+
+
+async def query_fedex_tracking(tracking_no: str) -> dict[str, Any]:
+    from playwright.async_api import async_playwright
+
+    normalized = normalize_tracking_number(tracking_no)
+    query_url = f'https://www.fedex.com/wtrk/track/?trknbr={normalized}'
+    logger.info("FedEx 查询: tracking_no=%s", normalized)
+
+    cdp_process = begin_local_cdp_session()
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            force_new_context=True,
+            viewport={'width': 1440, 'height': 900},
+        )
+
+        try:
+            await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
+
+            cookie_button = page.locator('#accept').first
+            try:
+                if await cookie_button.count() > 0 and await cookie_button.is_visible(timeout=1000):
+                    await cookie_button.click(timeout=5000)
+                    await page.wait_for_timeout(600)
+            except Exception:
+                pass
+
+            progress_container = page.locator('div.shipment-status-progress-container').first
+            await progress_container.wait_for(timeout=30000)
+
+            active_step = page.locator('div.shipment-status-progress-step.active').first
+            await active_step.wait_for(timeout=15000)
+            content_nodes = active_step.locator('span.shipment-status-progress-step-label-content')
+            content_values: list[str] = []
+            try:
+                count = await content_nodes.count()
+            except Exception:
+                count = 0
+            for index in range(count):
+                try:
+                    text = clean_text(await content_nodes.nth(index).inner_text())
+                except Exception:
+                    text = ''
+                if text:
+                    content_values.append(text)
+
+            active_text = clean_text(await active_step.inner_text())
+            status = content_values[0] if len(content_values) >= 1 else ''
+            location = content_values[1] if len(content_values) >= 2 else ''
+            time_text = content_values[2] if len(content_values) >= 3 else ''
+            if not status:
+                lines = [clean_text(line) for line in active_text.splitlines() if clean_text(line)]
+                if len(lines) >= 4:
+                    status = lines[1]
+                    location = lines[2]
+                    time_text = lines[3]
+                elif len(lines) >= 3:
+                    status = lines[0]
+                    location = lines[1]
+                    time_text = lines[2]
+                elif len(lines) >= 1:
+                    status = lines[-1]
+
+            latest_track = {
+                '时间': time_text,
+                '地点': location,
+                '内容': status or active_text,
+            }
+            return {
+                '平台': 'FEDEX',
+                '查询值': normalized,
+                '当前页面标题': await page.title(),
+                '当前URL': page.url,
+                '最新轨迹': latest_track,
+                '物流轨迹': [latest_track] if any(latest_track.values()) else [],
+            }
+        finally:
+            await cleanup_cdp_query_page(page, context, owns_context)
+            end_local_cdp_session(cdp_process)
 
 
 def build_gofo_download_dir(base_dir: Path | None = None, day_text: str | None = None) -> Path:
@@ -3308,7 +3436,7 @@ async def query_usps_tracking(tracking_no: str) -> dict[str, Any]:
                     raise RuntimeError(
                         f'USPS 查询结果页跟踪号不匹配: expected={normalized} actual={tracking_number_text or "empty"}'
                     )
-                await page.wait_for_timeout(random.randint(1800, 3200))
+                await page.wait_for_timeout(random.randint(900, 1600))
                 search_submitted = True
             except Exception as exc:
                 submit_error = str(exc)
@@ -3370,11 +3498,11 @@ async def query_usps_tracking(tracking_no: str) -> dict[str, Any]:
                         await page.wait_for_load_state('networkidle', timeout=20000)
                     except PlaywrightTimeoutError:
                         pass
-                    await page.wait_for_timeout(4000 + attempt * 2000)
+                    await page.wait_for_timeout(1800 + attempt * 1200)
                     try:
-                        await page.wait_for_selector('div.tb-step, p.tb-status, p.tb-status-detail', timeout=45000)
+                        await page.wait_for_selector('div.tb-step, p.tb-status, p.tb-status-detail', timeout=15000)
                     except PlaywrightTimeoutError:
-                        await page.wait_for_timeout(3000)
+                        await page.wait_for_timeout(1200)
                     html = await page.content()
                     items = extract_usps_tracking_items_from_html(html)
                     if items:

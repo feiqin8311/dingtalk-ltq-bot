@@ -80,6 +80,7 @@ class UspsQueryExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         search_input = SimpleNamespace(
             wait_for=mock.AsyncMock(side_effect=[TimeoutError("blocked"), None]),
+            input_value=mock.AsyncMock(return_value=tracking_no),
             count=mock.AsyncMock(return_value=1),
             first=None,
         )

@@ -117,6 +117,26 @@ class ApiServerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events, ["start:A", "end:A", "start:B", "end:B"])
 
+    async def test_query_tracking_endpoint_wraps_fedex_link(self):
+        api_server = self._load_module()
+        payload = api_server.TrackingQueryRequest(tracking_no="381685128780")
+        expected = {
+            "平台": "FEDEX",
+            "查询值": "381685128780",
+            "物流轨迹": [{"时间": "6/3/26 9:03 AM", "内容": "Departed FedEx location", "地点": "CYPRESS, TX"}],
+            "最新轨迹": {"时间": "6/3/26 9:03 AM", "内容": "Departed FedEx location", "地点": "CYPRESS, TX"},
+            "物流链接": "https://www.fedex.com/wtrk/track/?trknbr=381685128780",
+        }
+
+        raw_result = dict(expected)
+        raw_result.pop("物流链接")
+
+        with patch.object(api_server, "query_tracking_number", new=AsyncMock(return_value=raw_result)):
+            result = await api_server.query_tracking(payload)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"], expected)
+
 
 if __name__ == "__main__":
     unittest.main()

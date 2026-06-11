@@ -246,6 +246,21 @@ class TrackingModeMenuTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, expected)
 
+    async def test_query_tracking_number_routes_to_fedex_helper_for_38_prefix(self):
+        import logistics_query
+
+        expected = {
+            "平台": "FEDEX",
+            "查询值": "381685128780",
+            "物流轨迹": [],
+            "最新轨迹": {},
+        }
+
+        with patch.object(logistics_query, "query_fedex_tracking", new=AsyncMock(return_value=expected), create=True):
+            result = await logistics_query.query_tracking_number("381685128780")
+
+        self.assertEqual(result, expected)
+
     async def test_query_tracking_number_routes_to_yuntrack_helper_for_h00rva(self):
         import logistics_query
 
