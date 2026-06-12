@@ -42,6 +42,8 @@ class _FakePingyiPage:
 
 def _install_fake_dingtalk_stream():
     module = types.ModuleType("dingtalk_stream")
+    utils_module = types.ModuleType("dingtalk_stream.utils")
+    utils_module.DINGTALK_OPENAPI_ENDPOINT = "https://oapi.dingtalk.com"
 
     class ChatbotHandler:
         def __init__(self, *args, **kwargs):
@@ -72,6 +74,7 @@ def _install_fake_dingtalk_stream():
     module.ChatbotMessage = ChatbotMessage
     module.Credential = Credential
     module.DingTalkStreamClient = DingTalkStreamClient
+    module.utils = utils_module
     return module
 
 
@@ -85,7 +88,7 @@ class PingyiMainFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_query_tracking_info_awaits_pingyi_coroutine_directly(self):
         fake_stream = _install_fake_dingtalk_stream()
         fake_dotenv = _install_fake_dotenv()
-        with mock.patch.dict(sys.modules, {"dingtalk_stream": fake_stream, "dotenv": fake_dotenv}):
+        with mock.patch.dict(sys.modules, {"dingtalk_stream": fake_stream, "dingtalk_stream.utils": fake_stream.utils, "dotenv": fake_dotenv}):
             if "main" in sys.modules:
                 del sys.modules["main"]
             import main

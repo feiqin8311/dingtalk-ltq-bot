@@ -383,6 +383,136 @@ class UspsQueryExecutionTests(unittest.IsolatedAsyncioTestCase):
         fresh_page.close.assert_awaited_once()
         fresh_context.close.assert_awaited_once()
 
+    async def test_query_usps_tracking_falls_back_to_homepage_when_tools_page_stays_blocked(self):
+        tracking_no = "9214490411372848389407"
+        parsed_items = [{"时间": "2026-06-08", "内容": "Delivered", "地点": "TX"}]
+
+        tools_input = SimpleNamespace(
+            wait_for=mock.AsyncMock(side_effect=TimeoutError("tools blocked")),
+            input_value=mock.AsyncMock(return_value=""),
+            count=mock.AsyncMock(return_value=1),
+            first=None,
+        )
+        tools_input.first = tools_input
+        home_input = SimpleNamespace(
+            wait_for=mock.AsyncMock(),
+            input_value=mock.AsyncMock(return_value=tracking_no),
+            count=mock.AsyncMock(return_value=1),
+            first=None,
+        )
+        home_input.first = home_input
+        home_button = SimpleNamespace(
+            wait_for=mock.AsyncMock(),
+            click=mock.AsyncMock(),
+            count=mock.AsyncMock(return_value=1),
+            first=None,
+        )
+        home_button.first = home_button
+        tracking_number = SimpleNamespace(
+            wait_for=mock.AsyncMock(),
+            inner_text=mock.AsyncMock(return_value=tracking_no),
+            count=mock.AsyncMock(return_value=1),
+            first=None,
+        )
+        tracking_number.first = tracking_number
+        hidden_home_button = SimpleNamespace(
+            wait_for=mock.AsyncMock(side_effect=TimeoutError("hidden button")),
+            click=mock.AsyncMock(),
+            count=mock.AsyncMock(return_value=1),
+            is_visible=mock.AsyncMock(return_value=False),
+            first=None,
+        )
+        hidden_home_button.first = hidden_home_button
+        visible_home_button = SimpleNamespace(
+            wait_for=mock.AsyncMock(),
+            click=mock.AsyncMock(),
+            count=mock.AsyncMock(return_value=1),
+            is_visible=mock.AsyncMock(return_value=True),
+            first=None,
+        )
+        visible_home_button.first = visible_home_button
+
+        fresh_page = SimpleNamespace(
+            url="https://tools.usps.com/tracking/",
+            goto=mock.AsyncMock(),
+            reload=mock.AsyncMock(),
+            wait_for_load_state=mock.AsyncMock(),
+            wait_for_timeout=mock.AsyncMock(),
+            wait_for_selector=mock.AsyncMock(),
+            wait_for_url=mock.AsyncMock(),
+            content=mock.AsyncMock(side_effect=[USPS_BLOCKED_HTML, USPS_BLOCKED_HTML, USPS_HTML]),
+            bring_to_front=mock.AsyncMock(),
+            title=mock.AsyncMock(return_value="USPS Tracking"),
+            screenshot=mock.AsyncMock(),
+            close=mock.AsyncMock(),
+            locator=mock.Mock(
+                side_effect=lambda selector: {
+                    "#tracking-input": tools_input,
+                    "#home-input": home_input,
+                    "button.input--search[type=\"submit\"]": hidden_home_button,
+                    "button.input--search.btn:visible": visible_home_button,
+                    "form#search-site button[type=\"submit\"]": visible_home_button,
+                    "#trackBtn": home_button,
+                    "#trackingNum": tracking_number,
+                }.get(selector, tools_input)
+            ),
+        )
+        fresh_context = SimpleNamespace(
+            pages=[],
+            new_page=mock.AsyncMock(return_value=fresh_page),
+            close=mock.AsyncMock(),
+        )
+        browser = SimpleNamespace(
+            contexts=[],
+            new_context=mock.AsyncMock(return_value=fresh_context),
+        )
+        chromium = SimpleNamespace(connect_over_cdp=mock.AsyncMock(return_value=browser))
+
+        class _FakePlaywright:
+            def __init__(self, chromium):
+                self.chromium = chromium
+
+        class _FakeAsyncPlaywright:
+            async def __aenter__(self):
+                return _FakePlaywright(chromium)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        fake_playwright_async_api = types.ModuleType("playwright.async_api")
+        fake_playwright_async_api.async_playwright = lambda: _FakeAsyncPlaywright()
+        fake_playwright_async_api.TimeoutError = TimeoutError
+
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.async_api = fake_playwright_async_api
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "playwright": fake_playwright,
+                    "playwright.async_api": fake_playwright_async_api,
+                },
+            ),
+            mock.patch.object(logistics_query, "begin_local_cdp_session", return_value=None),
+            mock.patch.object(logistics_query, "end_local_cdp_session"),
+            mock.patch.object(logistics_query, "get_local_cdp_endpoint", return_value="ws://127.0.0.1:19444/devtools/browser/demo"),
+            mock.patch.object(logistics_query, "apply_usps_browser_stealth", new=mock.AsyncMock()),
+            mock.patch.object(logistics_query, "extract_usps_tracking_items_from_html", return_value=parsed_items),
+            mock.patch.object(logistics_query, "_type_like_human", new=mock.AsyncMock()) as type_like_human_mock,
+        ):
+            result = await logistics_query.query_usps_tracking(tracking_no)
+
+        self.assertEqual(result["平台"], "USPS")
+        self.assertEqual(result["物流轨迹"], parsed_items)
+        fresh_page.goto.assert_any_await("https://tools.usps.com/tracking/", wait_until="domcontentloaded", timeout=60000)
+        fresh_page.goto.assert_any_await("https://www.usps.com/", wait_until="domcontentloaded", timeout=60000)
+        type_like_human_mock.assert_any_await(fresh_page, "#home-input", tracking_no, delay_range=(100, 210))
+        visible_home_button.click.assert_awaited_once()
+        tracking_number.wait_for.assert_awaited_once()
+        fresh_page.close.assert_awaited_once()
+        fresh_context.close.assert_awaited_once()
+
     async def test_query_usps_tracking_returns_error_when_input_is_truncated(self):
         tracking_no = "9361289741064766954915"
 

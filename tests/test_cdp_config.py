@@ -1,6 +1,7 @@
 import importlib
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -9,7 +10,7 @@ import logistics_query
 
 
 class CdpConfigDefaultsTests(unittest.TestCase):
-    def test_defaults_allow_project_to_start_local_cdp(self):
+    def test_defaults_use_external_shared_cdp(self):
         with mock.patch.dict(
             os.environ,
             {
@@ -24,7 +25,7 @@ class CdpConfigDefaultsTests(unittest.TestCase):
         try:
             self.assertEqual(module.LOCAL_CDP_HOST, "127.0.0.1")
             self.assertEqual(module.LOCAL_CDP_PORT, 19444)
-            self.assertFalse(module.LOCAL_CDP_EXTERNAL_ONLY)
+            self.assertTrue(module.LOCAL_CDP_EXTERNAL_ONLY)
         finally:
             importlib.reload(logistics_query)
 
@@ -135,6 +136,7 @@ class CdpProfileCleanupTests(unittest.TestCase):
              mock.patch.object(logistics_query, "is_local_port_in_use", return_value=False), \
              mock.patch.object(logistics_query, "resolve_local_cdp_browser_bin", return_value="/chrome"), \
              mock.patch.object(logistics_query, "LOCAL_CDP_USER_DATA_DIR", str(Path(temp_dir) / "profile")), \
+             mock.patch.object(logistics_query, "LOCAL_CDP_EXTERNAL_ONLY", False), \
              mock.patch.object(logistics_query.subprocess, "Popen", return_value=popen_mock) as popen_call:
             logistics_query.ensure_local_cdp_browser()
 
@@ -156,6 +158,7 @@ class CdpProfileCleanupTests(unittest.TestCase):
                  mock.patch.object(logistics_query, "is_local_port_in_use", return_value=False), \
                  mock.patch.object(logistics_query, "resolve_local_cdp_browser_bin", return_value="/chrome"), \
                  mock.patch.object(logistics_query, "LOCAL_CDP_USER_DATA_DIR", str(Path(temp_dir) / "profile")), \
+                 mock.patch.object(logistics_query, "LOCAL_CDP_EXTERNAL_ONLY", False), \
                  mock.patch.object(logistics_query.subprocess, "Popen", return_value=popen_mock):
                 logistics_query.ensure_local_cdp_browser()
 
@@ -165,11 +168,61 @@ class CdpProfileCleanupTests(unittest.TestCase):
             if pid_file.exists():
                 pid_file.unlink()
 
+    def test_ensure_local_cdp_browser_allows_slow_windows_startup_before_succeeding(self):
+        calls = [False] * 24 + [True]
+        popen_mock = mock.Mock()
+        popen_mock.poll.return_value = None
+        popen_mock.pid = 43210
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(logistics_query, "is_local_cdp_listening", side_effect=lambda: calls.pop(0)), \
+             mock.patch.object(logistics_query, "is_local_port_in_use", return_value=False), \
+             mock.patch.object(logistics_query, "resolve_local_cdp_browser_bin", return_value="/chrome"), \
+             mock.patch.object(logistics_query, "LOCAL_CDP_USER_DATA_DIR", str(Path(temp_dir) / "profile")), \
+             mock.patch.object(logistics_query, "LOCAL_CDP_EXTERNAL_ONLY", False), \
+             mock.patch.object(logistics_query, "cleanup_stale_cdp_profile_locks"), \
+             mock.patch.object(logistics_query.os, "name", "nt"), \
+             mock.patch.object(logistics_query.time, "sleep") as sleep_mock, \
+             mock.patch.object(logistics_query.subprocess, "Popen", return_value=popen_mock):
+            process = logistics_query.ensure_local_cdp_browser()
+
+        self.assertIs(process, popen_mock)
+        self.assertGreaterEqual(sleep_mock.call_count, 20)
+
+    def test_register_local_cdp_session_records_pid_and_owner(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(logistics_query.browser_state_service, "local_cdp_state_dir", return_value=Path(temp_dir)), \
+             mock.patch.object(logistics_query.os, "getpid", return_value=12345):
+            total = logistics_query.register_local_cdp_session(owner_pid=54321)
+            state = logistics_query.load_local_cdp_state()
+
+        self.assertEqual(total, 1)
+        self.assertEqual(state["owner_pid"], 54321)
+        self.assertEqual(state["sessions"], {"12345": 1})
+
+    def test_unregister_local_cdp_session_keeps_browser_for_non_owner(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(logistics_query.browser_state_service, "local_cdp_state_dir", return_value=Path(temp_dir)), \
+             mock.patch.object(logistics_query.os, "getpid", return_value=12345):
+            logistics_query.save_local_cdp_state(
+                {
+                    "owner_pid": 54321,
+                    "browser_pid": 54321,
+                    "sessions": {"12345": 1},
+                    "updated_at": time.time(),
+                }
+            )
+            remaining, should_stop = logistics_query.unregister_local_cdp_session()
+
+        self.assertEqual(remaining, 0)
+        self.assertFalse(should_stop)
+
     def test_end_local_cdp_session_only_stops_browser_for_last_session(self):
         original_count = logistics_query._LOCAL_CDP_ACTIVE_SESSIONS
         logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = 2
         try:
-            with mock.patch.object(logistics_query, "stop_local_cdp_browser") as stop_mock:
+            with mock.patch.object(logistics_query, "unregister_local_cdp_session", side_effect=[(1, False), (0, True)]), \
+                 mock.patch.object(logistics_query, "stop_local_cdp_browser") as stop_mock:
                 logistics_query.end_local_cdp_session(None)
                 stop_mock.assert_not_called()
                 self.assertEqual(logistics_query._LOCAL_CDP_ACTIVE_SESSIONS, 1)
@@ -198,6 +251,17 @@ class CdpProfileCleanupTests(unittest.TestCase):
             stdout=logistics_query.subprocess.DEVNULL,
             stderr=logistics_query.subprocess.DEVNULL,
         )
+
+    def test_end_local_cdp_session_shared_non_owner_does_not_stop_browser(self):
+        original_count = logistics_query._LOCAL_CDP_ACTIVE_SESSIONS
+        logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = 1
+        try:
+            with mock.patch.object(logistics_query, "unregister_local_cdp_session", return_value=(0, False)), \
+                 mock.patch.object(logistics_query, "stop_local_cdp_browser") as stop_mock:
+                logistics_query.end_local_cdp_session(None)
+                stop_mock.assert_not_called()
+        finally:
+            logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = original_count
 
 
 if __name__ == "__main__":

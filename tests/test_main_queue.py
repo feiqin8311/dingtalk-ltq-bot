@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from logistics_query import BaosenLoginError, get_baosen_credentials
+from logistics_query import get_baosen_credentials
 
 
 def _install_fake_dingtalk_stream():
@@ -152,15 +152,15 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["start:A", "end:A", "start:B", "end:B"])
 
     async def test_baosen_login_error_is_not_retried(self):
-        handler, _ = self._make_handler()
+        handler, main_module = self._make_handler()
         attempts = 0
 
         async def operation():
             nonlocal attempts
             attempts += 1
-            raise BaosenLoginError("堡森登录未成功")
+            raise main_module.BaosenLoginError("堡森登录未成功")
 
-        with self.assertRaises(BaosenLoginError):
+        with self.assertRaises(main_module.BaosenLoginError):
             await handler._run_tracking_query_with_retry(
                 platform="堡森",
                 query_value="HZNL26020133",

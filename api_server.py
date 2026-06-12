@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from typing import Any
 
@@ -22,6 +23,8 @@ from logistics_query import (
 )
 from qq_query import query_qq
 
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Logistics Query API",
@@ -69,11 +72,20 @@ def build_api_response(*, success: bool, data: dict[str, Any] | None = None, err
 async def _query_fba_tracking_result(order: dict[str, Any], fba_code: str, explicit_platform: str) -> dict[str, Any] | None:
     platform = decide_platform(order, explicit_platform)
     tracking_no = get_primary_logistics_no(order)
+    logger.info(
+        "API FBA轨迹查询: FBA=%s 平台=%s 查询值=%s explicit_platform=%s",
+        fba_code,
+        platform,
+        tracking_no,
+        explicit_platform,
+    )
 
     if platform == "none":
+        logger.info("API FBA轨迹查询跳过: FBA=%s 平台=none", fba_code)
         return None
 
     if platform in {"meitong", "agl", "baosen", "qq", "17track"} and not tracking_no:
+        logger.warning("API FBA轨迹查询失败: FBA=%s 平台=%s 错误=缺少物流编号", fba_code, platform)
         return {
             "平台": platform,
             "查询值": "",
@@ -130,6 +142,7 @@ async def health() -> dict[str, Any]:
 )
 async def query_tracking(payload: TrackingQueryRequest) -> dict[str, Any]:
     platform = decide_tracking_platform(payload.tracking_no)
+    logger.info("API跟踪号查询开始: tracking_no=%s 平台=%s", payload.tracking_no, platform)
     if platform in SERIAL_BROWSER_TRACKING_PLATFORMS:
         result = await run_browser_tracking_query_with_queue(
             platform=platform.upper(),
@@ -142,7 +155,19 @@ async def query_tracking(payload: TrackingQueryRequest) -> dict[str, Any]:
     result = attach_tracking_result_link(result)
     error = str(result.get("错误", "") or "").strip()
     if error:
+        logger.warning(
+            "API跟踪号查询失败: tracking_no=%s 平台=%s 错误=%s",
+            payload.tracking_no,
+            result.get("平台", platform),
+            error,
+        )
         return build_api_response(success=False, data=result, error=error)
+    logger.info(
+        "API跟踪号查询完成: tracking_no=%s 平台=%s 条数=%s",
+        payload.tracking_no,
+        result.get("平台", platform),
+        len(result.get("物流轨迹") or []),
+    )
     return build_api_response(success=True, data=result, error=None)
 
 
@@ -153,6 +178,13 @@ async def query_tracking(payload: TrackingQueryRequest) -> dict[str, Any]:
     dependencies=[Depends(validate_api_key)],
 )
 async def query_fba(payload: FbaQueryRequest) -> dict[str, Any]:
+    logger.info(
+        "API FBA查询开始: FBA=%s explicit_platform=%s include_order=%s include_tracking=%s",
+        payload.fba_code,
+        payload.platform,
+        payload.include_order,
+        payload.include_tracking,
+    )
     order = find_order_by_fba(payload.fba_code)
     matched_platform = decide_platform(order, payload.platform)
 
@@ -164,6 +196,7 @@ async def query_fba(payload: FbaQueryRequest) -> dict[str, Any]:
     }
 
     if not order:
+        logger.warning("API FBA查询失败: FBA=%s 错误=未找到对应FBA记录", payload.fba_code)
         return build_api_response(success=False, data=result, error="未找到对应FBA记录")
 
     if payload.include_tracking:
@@ -174,5 +207,21 @@ async def query_fba(payload: FbaQueryRequest) -> dict[str, Any]:
         tracking_error = str(result["物流查询结果"].get("错误", "") or "").strip()
 
     if tracking_error:
+        logger.warning(
+            "API FBA查询失败: FBA=%s 平台=%s 错误=%s",
+            payload.fba_code,
+            matched_platform,
+            tracking_error,
+        )
         return build_api_response(success=False, data=result, error=tracking_error)
+    track_count = 0
+    if isinstance(result.get("物流查询结果"), dict):
+        track_count = len(result["物流查询结果"].get("物流轨迹") or [])
+    logger.info(
+        "API FBA查询完成: FBA=%s 平台=%s include_tracking=%s 条数=%s",
+        payload.fba_code,
+        matched_platform,
+        payload.include_tracking,
+        track_count,
+    )
     return build_api_response(success=True, data=result, error=None)

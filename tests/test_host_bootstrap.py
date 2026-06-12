@@ -56,6 +56,13 @@ class StartScriptTests(unittest.TestCase):
         self.assertIn('scripts\\windows\\start_all.ps1', script_text)
         self.assertIn("& $ScriptPath @args", script_text)
 
+    def test_windows_start_all_uses_log_aggregator(self):
+        project_dir = Path(__file__).resolve().parents[1]
+        script_text = (project_dir / "scripts" / "windows" / "start_all.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("scripts\\run_all.py", script_text)
+        self.assertNotIn("Start-Process `\n    -FilePath $PythonExe `\n    -ArgumentList @(\"-m\", \"uvicorn\"", script_text)
+
 
 if __name__ == "__main__":
     unittest.main()

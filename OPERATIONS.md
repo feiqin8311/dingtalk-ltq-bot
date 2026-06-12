@@ -220,6 +220,8 @@
 ## 双平台运行约定
 - 统一本地 API 端口: `18081`
 - 统一本地 CDP 端口: `19444`
+- API 和机器人统一连接同一套 CDP 浏览器；`LOCAL_CDP_EXTERNAL_ONLY=true` 时，业务进程不会再自行启动第二个浏览器
+- Windows 启动脚本会优先复用 `LOCAL_CDP_URL`，不可用时用系统 Chrome/Edge 启动共享 CDP，不再自动选择 Playwright 的 `Google for Testing`
 - Windows 配置模板: `.env.windows.example`
 - Linux / WSL 配置模板: `.env.linux.example`
 - Windows 启动脚本会优先读取 `.env.windows`，再回退到 `.env`
@@ -227,6 +229,7 @@
 - Windows API 启动: `.\scripts\windows\start_api.ps1`
 - Linux / WSL API 启动: `bash ./scripts/linux/start_api.sh`
 - Linux / WSL 机器人启动: `bash ./scripts/linux/start_bot_linux.sh`
+- Windows 全量启动: `.\scripts\windows\start_all.ps1` 会在同一个终端聚合 API 和机器人日志，日志前缀分别为 `[api]`、`[bot]`
 - 根目录旧脚本保留为兼容壳，后续统一使用 `scripts/` 下的新路径
 - Windows 主执行环境继续优先承载 `QQ / NapCat / Windows Playwright` 相关能力。
 - Linux / WSL 执行环境用于兼容运行 API、浏览器查询和无 Windows 桌面依赖的平台。

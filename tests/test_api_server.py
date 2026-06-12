@@ -53,22 +53,27 @@ class ApiServerTests(unittest.IsolatedAsyncioTestCase):
         raw_result.pop("物流链接")
 
         with patch.object(api_server, "query_tracking_number", new=AsyncMock(return_value=raw_result)):
-            result = await api_server.query_tracking(payload)
+            with self.assertLogs("api_server", level="INFO") as logs:
+                result = await api_server.query_tracking(payload)
 
         self.assertTrue(result["success"])
         self.assertEqual(result["data"], expected)
         self.assertIsNone(result["error"])
+        self.assertTrue(any("API跟踪号查询开始" in line for line in logs.output))
+        self.assertTrue(any("API跟踪号查询完成" in line for line in logs.output))
 
     async def test_query_fba_endpoint_without_order_wraps_error(self):
         api_server = self._load_module()
         payload = api_server.FbaQueryRequest(fba_code="FBA123456")
 
         with patch.object(api_server, "find_order_by_fba", return_value=None):
-            result = await api_server.query_fba(payload)
+            with self.assertLogs("api_server", level="WARNING") as logs:
+                result = await api_server.query_fba(payload)
 
         self.assertFalse(result["success"])
         self.assertEqual(result["error"], "未找到对应FBA记录")
         self.assertEqual(result["data"]["命中平台"], "none")
+        self.assertTrue(any("API FBA查询失败" in line for line in logs.output))
 
     async def test_query_fba_endpoint_with_tracking_platform(self):
         api_server = self._load_module()

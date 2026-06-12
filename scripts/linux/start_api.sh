@@ -32,27 +32,8 @@ if [[ -x "$PROJECT_DIR/.venv/bin/python" ]]; then
   PYTHON_EXE="$PROJECT_DIR/.venv/bin/python"
 fi
 
-resolve_playwright_chromium() {
-  "$PYTHON_EXE" - <<'PY'
-import sys
-try:
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        path = str(getattr(p.chromium, "executable_path", "") or "").strip()
-        if path:
-            sys.stdout.write(path)
-except Exception:
-    pass
-PY
-}
-
-if [[ -z "${LOCAL_CDP_BROWSER_BIN:-}" ]]; then
-  RESOLVED_CDP_BROWSER="$(resolve_playwright_chromium || true)"
-  if [[ -n "${RESOLVED_CDP_BROWSER}" && -x "${RESOLVED_CDP_BROWSER}" ]]; then
-    export LOCAL_CDP_BROWSER_BIN="$RESOLVED_CDP_BROWSER"
-  elif [[ -n "${CHROME_BIN:-}" && -x "${CHROME_BIN}" ]]; then
-    export LOCAL_CDP_BROWSER_BIN="$CHROME_BIN"
-  fi
+if [[ -z "${LOCAL_CDP_BROWSER_BIN:-}" && -n "${CHROME_BIN:-}" && -x "${CHROME_BIN}" ]]; then
+  export LOCAL_CDP_BROWSER_BIN="$CHROME_BIN"
 fi
 
 if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
