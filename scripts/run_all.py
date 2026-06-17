@@ -5,8 +5,7 @@ import signal
 import subprocess
 import sys
 import threading
-import urllib.error
-import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 
@@ -20,6 +19,15 @@ REQUIRED_MODULES = {
     'api': ['fastapi', 'uvicorn'],
     'bot': ['dingtalk_stream', 'dotenv', 'requests'],
 }
+
+
+def _append_runtime_event(project_dir: Path, message: str) -> None:
+    log_dir = project_dir / 'runtime'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / 'run_all-exit.log'
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with log_path.open('a', encoding='utf-8') as handle:
+        handle.write(f'[{timestamp}] {message}\n')
 
 
 def _missing_modules() -> list[str]:
@@ -66,18 +74,27 @@ def _terminate_process(process: subprocess.Popen) -> None:
             pass
 
 
-def _api_health_url(host: str, port: str) -> str:
-    request_host = '127.0.0.1' if host in {'0.0.0.0', '::'} else host
-    return f'http://{request_host}:{port}/api/health'
-
-
-def _is_existing_api_ready(host: str, port: str) -> bool:
+def _wait_before_exit(project_dir: Path) -> None:
     try:
-        with urllib.request.urlopen(_api_health_url(host, port), timeout=2) as response:
-            body = response.read().decode('utf-8', errors='replace')
-            return response.status == 200 and 'logistics-query-api' in body
-    except (OSError, urllib.error.URLError, TimeoutError):
-        return False
+        message = '[run] press Enter to close this window'
+        print(message, flush=True)
+        _append_runtime_event(project_dir, message)
+        input()
+    except EOFError:
+        pass
+    except KeyboardInterrupt:
+        pass
+
+
+def _summarize_remaining_processes(project_dir: Path, processes: dict[str, subprocess.Popen]) -> None:
+    for name, process in processes.items():
+        try:
+            alive = process.poll() is None
+        except Exception:
+            alive = False
+        message = f'[run] remaining process {name}: alive={alive} pid={getattr(process, "pid", "?")}'
+        print(message, flush=True)
+        _append_runtime_event(project_dir, message)
 
 
 def main() -> int:
@@ -93,17 +110,27 @@ def main() -> int:
     env['PYTHONIOENCODING'] = 'utf-8'
     env['PYTHONUTF8'] = '1'
 
+    startup_messages = [
+        f'[run] project directory: {project_dir}',
+        f'[run] python executable: {python_exe}',
+    ]
+    for message in startup_messages:
+        print(message, flush=True)
+        _append_runtime_event(project_dir, message)
+
     missing = _missing_modules()
     if missing:
-        print(f"[run] missing Python modules: {', '.join(missing)}", flush=True)
-        print(f"[run] install dependencies with: {python_exe} -m pip install -r {project_dir / 'requirements.txt'}", flush=True)
+        message = f"[run] missing Python modules: {', '.join(missing)}"
+        print(message, flush=True)
+        _append_runtime_event(project_dir, message)
+        install_message = f"[run] install dependencies with: {python_exe} -m pip install -r {project_dir / 'requirements.txt'}"
+        print(install_message, flush=True)
+        _append_runtime_event(project_dir, install_message)
         return 1
 
-    commands = {}
-    if _is_existing_api_ready(str(args.api_host), str(args.api_port)):
-        print(f'[api] existing API is ready: {_api_health_url(str(args.api_host), str(args.api_port))}', flush=True)
-    else:
-        commands['api'] = [python_exe, '-m', 'uvicorn', 'api_server:app', '--host', str(args.api_host), '--port', str(args.api_port)]
+    commands = {
+        'api': [python_exe, '-m', 'uvicorn', 'api_server:app', '--host', str(args.api_host), '--port', str(args.api_port)],
+    }
     commands['bot'] = [python_exe, str(project_dir / 'main.py')]
     processes: dict[str, subprocess.Popen] = {}
     threads: list[threading.Thread] = []
@@ -139,11 +166,14 @@ def main() -> int:
                 exit_code = process.poll()
                 if exit_code is None:
                     continue
-                print(f'[{name}] exited with code {exit_code}', flush=True)
+                message = f'[{name}] exited with code {exit_code}'
+                print(message, flush=True)
+                _append_runtime_event(project_dir, message)
                 processes.pop(name, None)
-                if exit_code != 0:
-                    stop_all()
-                    return int(exit_code)
+                _summarize_remaining_processes(project_dir, processes)
+                stop_all()
+                _wait_before_exit(project_dir)
+                return int(exit_code)
             for thread in threads:
                 thread.join(timeout=0.1)
     finally:

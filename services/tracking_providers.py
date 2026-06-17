@@ -396,6 +396,79 @@ async def query_usps_provider(tracking_no: str, deps: TrackingProviderDeps) -> d
             class _UspsToolsBlockedError(RuntimeError):
                 pass
 
+            async def _fill_input_with_fallback(
+                selector: str,
+                value: str,
+                *,
+                delay_range: tuple[int, int],
+                field_label: str,
+                skip_initial_wait: bool = False,
+            ) -> None:
+                locator = page.locator(selector).first
+                if not skip_initial_wait:
+                    await locator.wait_for(timeout=20000)
+                try:
+                    await type_like_human(page, selector, value, delay_range=delay_range)
+                    return
+                except Exception as exc:
+                    logger.warning("USPS 查询: %s 人工输入失败，改用稳态回退 tracking_no=%s error=%s", field_label, normalized, exc)
+                try:
+                    await page.evaluate(
+                        """
+                        ({selector, value}) => {
+                            const element = document.querySelector(selector);
+                            if (!element) {
+                                throw new Error(`element not found: ${selector}`);
+                            }
+                            element.scrollIntoView({block: 'center', inline: 'center'});
+                            element.focus();
+                            if ('value' in element) {
+                                element.value = '';
+                                element.dispatchEvent(new Event('input', {bubbles: true}));
+                                element.value = value;
+                                element.dispatchEvent(new Event('input', {bubbles: true}));
+                                element.dispatchEvent(new Event('change', {bubbles: true}));
+                            }
+                        }
+                        """,
+                        {'selector': selector, 'value': str(value)},
+                    )
+                except Exception:
+                    await locator.fill('')
+                    await page.wait_for_timeout(random.randint(180, 360))
+                    await locator.type(str(value), delay=random.randint(*delay_range))
+                await page.wait_for_timeout(random.randint(500, 1100))
+
+            async def _click_with_fallback(button_selector: str, *, field_selector: str | None = None, description: str) -> None:
+                button = page.locator(button_selector).first
+                await button.wait_for(timeout=12000)
+                await page.wait_for_timeout(random.randint(400, 900))
+                try:
+                    await button.click(timeout=10000)
+                    return
+                except Exception as exc:
+                    logger.warning("USPS 查询: %s 点击失败，改用回退提交 tracking_no=%s error=%s", description, normalized, exc)
+                try:
+                    await page.evaluate(
+                        """
+                        (selector) => {
+                            const element = document.querySelector(selector);
+                            if (!element) {
+                                throw new Error(`element not found: ${selector}`);
+                            }
+                            element.scrollIntoView({block: 'center', inline: 'center'});
+                            element.click();
+                        }
+                        """,
+                        button_selector,
+                    )
+                    return
+                except Exception:
+                    if field_selector is not None:
+                        await page.locator(field_selector).first.press('Enter', timeout=5000)
+                        return
+                    raise
+
             async def _wait_for_usps_tracking_input() -> None:
                 search_input = page.locator('#tracking-input').first
                 try:
@@ -429,23 +502,25 @@ async def query_usps_provider(tracking_no: str, deps: TrackingProviderDeps) -> d
                 search_input = page.locator('#tracking-input').first
                 await _wait_for_usps_tracking_input()
                 await page.wait_for_timeout(random.randint(600, 1300))
-                await type_like_human(page, '#tracking-input', normalized, delay_range=(90, 180))
+                await _fill_input_with_fallback(
+                    '#tracking-input',
+                    normalized,
+                    delay_range=(90, 180),
+                    field_label='tools 输入框',
+                    skip_initial_wait=True,
+                )
                 await page.wait_for_timeout(random.randint(500, 1100))
                 actual_input_value = normalize_tracking_number(await search_input.input_value())
                 if actual_input_value != normalized:
                     raise RuntimeError(f'USPS 输入框内容被截断或改写: expected={normalized} actual={actual_input_value or "empty"}')
-                search_button = page.locator('#trackBtn').first
-                await search_button.wait_for(timeout=10000)
-                await page.wait_for_timeout(random.randint(400, 900))
-                await search_button.click(timeout=10000)
+                await _click_with_fallback('#trackBtn', field_selector='#tracking-input', description='tools 查询按钮')
 
             async def _submit_via_homepage() -> None:
                 logger.info("USPS 查询: 回退首页入口 %s", homepage_url)
                 await page.goto(homepage_url, wait_until='domcontentloaded', timeout=60000)
                 search_input = page.locator('#home-input').first
-                await search_input.wait_for(timeout=20000)
                 await page.wait_for_timeout(random.randint(900, 1700))
-                await type_like_human(page, '#home-input', normalized, delay_range=(100, 210))
+                await _fill_input_with_fallback('#home-input', normalized, delay_range=(100, 210), field_label='首页输入框')
                 await page.wait_for_timeout(random.randint(700, 1300))
                 actual_input_value = normalize_tracking_number(await search_input.input_value())
                 if actual_input_value != normalized:
@@ -453,11 +528,8 @@ async def query_usps_provider(tracking_no: str, deps: TrackingProviderDeps) -> d
                 button_selectors = ['button.input--search.btn:visible', 'form#search-site button[type="submit"]', 'button.input--search[type="submit"]']
                 last_button_error: Exception | None = None
                 for button_selector in button_selectors:
-                    search_button = page.locator(button_selector).first
                     try:
-                        await search_button.wait_for(timeout=6000)
-                        await page.wait_for_timeout(random.randint(500, 1000))
-                        await search_button.click(timeout=10000)
+                        await _click_with_fallback(button_selector, field_selector='#home-input', description=f'首页查询按钮 {button_selector}')
                         return
                     except Exception as exc:
                         last_button_error = exc
@@ -479,10 +551,17 @@ async def query_usps_provider(tracking_no: str, deps: TrackingProviderDeps) -> d
                     submit_error = str(blocked_exc)
                     await _submit_via_homepage()
                 tracking_number = page.locator('#trackingNum').first
-                await tracking_number.wait_for(timeout=30000)
-                tracking_number_text = clean_text(await tracking_number.inner_text())
-                if tracking_number_text != normalized:
-                    raise RuntimeError(f'USPS 查询结果页跟踪号不匹配: expected={normalized} actual={tracking_number_text or "empty"}')
+                try:
+                    await tracking_number.wait_for(timeout=30000)
+                    tracking_number_text = clean_text(await tracking_number.inner_text())
+                    if tracking_number_text != normalized:
+                        raise RuntimeError(f'USPS 查询结果页跟踪号不匹配: expected={normalized} actual={tracking_number_text or "empty"}')
+                except Exception:
+                    html = await page.content()
+                    direct_items = extract_usps_tracking_items_from_html(html)
+                    if not direct_items:
+                        raise
+                    logger.info("USPS 查询: 直达结果页缺少跟踪号头部，但已解析到轨迹 tracking_no=%s", normalized)
                 await page.wait_for_timeout(random.randint(900, 1600))
                 search_submitted = True
             except Exception as exc:

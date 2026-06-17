@@ -24,6 +24,10 @@ from logistics_query import (
 from qq_query import query_qq
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(

@@ -63,6 +63,7 @@ LOCAL_CDP_USER_DATA_DIR = os.environ.get(
 LOCAL_CDP_BROWSER_BIN = os.environ.get('LOCAL_CDP_BROWSER_BIN', '').strip()
 LOCAL_CDP_HEADLESS = os.environ.get('LOCAL_CDP_HEADLESS', '').strip().lower() in {'1', 'true', 'yes', 'on'}
 LOCAL_CDP_EXTERNAL_ONLY = os.environ.get('LOCAL_CDP_EXTERNAL_ONLY', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
+LOCAL_CDP_STOP_WHEN_IDLE = os.environ.get('LOCAL_CDP_STOP_WHEN_IDLE', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 logger = logging.getLogger(__name__)
 
@@ -951,11 +952,19 @@ def end_local_cdp_session(process: subprocess.Popen | None = None) -> None:
         logger.info("本地 CDP: 保持浏览器运行 active_sessions=%s", active_sessions)
         return
 
+    if (
+        remaining_total_sessions == 0
+        and LOCAL_CDP_STOP_WHEN_IDLE
+        and LOCAL_CDP_HOST in {'127.0.0.1', 'localhost'}
+    ):
+        logger.info("本地 CDP: 所有共享会话已结束，停止空闲浏览器")
+        stop_local_cdp_browser(process)
+        return
+
     if not should_stop_browser:
         logger.info("本地 CDP: 共享浏览器继续保留 remaining_total_sessions=%s", remaining_total_sessions)
         return
-
-    stop_local_cdp_browser(process)
+    logger.info("本地 CDP: 共享浏览器继续保留 remaining_total_sessions=%s should_stop_browser=%s", remaining_total_sessions, should_stop_browser)
 
 
 async def open_cdp_query_page(browser, *, viewport: dict[str, int] | None = None, force_new_context: bool = False, **context_kwargs):

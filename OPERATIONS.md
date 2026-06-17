@@ -221,6 +221,7 @@
 - 统一本地 API 端口: `18081`
 - 统一本地 CDP 端口: `19444`
 - API 和机器人统一连接同一套 CDP 浏览器；`LOCAL_CDP_EXTERNAL_ONLY=true` 时，业务进程不会再自行启动第二个浏览器
+- `LOCAL_CDP_STOP_WHEN_IDLE=false` 时查询结束后保留共享浏览器；改成 `true` 才会在所有会话结束后自动关闭
 - Windows 启动脚本会优先复用 `LOCAL_CDP_URL`，不可用时用系统 Chrome/Edge 启动共享 CDP，不再自动选择 Playwright 的 `Google for Testing`
 - Windows 配置模板: `.env.windows.example`
 - Linux / WSL 配置模板: `.env.linux.example`

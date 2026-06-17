@@ -74,6 +74,112 @@ class UspsQueryParsingTests(unittest.TestCase):
 
 
 class UspsQueryExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_query_usps_tracking_falls_back_when_human_typing_click_is_blocked(self):
+        tracking_no = "9214490411372848389407"
+        parsed_items = [{"时间": "2026-06-08", "内容": "Delivered", "地点": "TX"}]
+
+        search_input = SimpleNamespace(
+            wait_for=mock.AsyncMock(),
+            input_value=mock.AsyncMock(return_value=tracking_no),
+            count=mock.AsyncMock(return_value=1),
+            press=mock.AsyncMock(),
+            first=None,
+        )
+        search_input.first = search_input
+        search_button = SimpleNamespace(
+            wait_for=mock.AsyncMock(),
+            click=mock.AsyncMock(),
+            count=mock.AsyncMock(return_value=1),
+            first=None,
+        )
+        search_button.first = search_button
+        tracking_number = SimpleNamespace(
+            wait_for=mock.AsyncMock(),
+            inner_text=mock.AsyncMock(return_value=tracking_no),
+            count=mock.AsyncMock(return_value=1),
+            first=None,
+        )
+        tracking_number.first = tracking_number
+
+        fresh_page = SimpleNamespace(
+            url="https://tools.usps.com/tracking/",
+            goto=mock.AsyncMock(),
+            reload=mock.AsyncMock(),
+            wait_for_load_state=mock.AsyncMock(),
+            wait_for_timeout=mock.AsyncMock(),
+            wait_for_selector=mock.AsyncMock(),
+            wait_for_url=mock.AsyncMock(),
+            content=mock.AsyncMock(return_value=USPS_HTML),
+            bring_to_front=mock.AsyncMock(),
+            title=mock.AsyncMock(return_value="USPS Tracking"),
+            screenshot=mock.AsyncMock(),
+            close=mock.AsyncMock(),
+            evaluate=mock.AsyncMock(),
+            locator=mock.Mock(
+                side_effect=lambda selector: (
+                    search_input
+                    if selector == "#tracking-input"
+                    else search_button
+                    if selector == "#trackBtn"
+                    else tracking_number
+                )
+            ),
+        )
+        fresh_context = SimpleNamespace(
+            pages=[],
+            new_page=mock.AsyncMock(return_value=fresh_page),
+            close=mock.AsyncMock(),
+        )
+        browser = SimpleNamespace(
+            contexts=[],
+            new_context=mock.AsyncMock(return_value=fresh_context),
+        )
+        chromium = SimpleNamespace(connect_over_cdp=mock.AsyncMock(return_value=browser))
+
+        class _FakePlaywright:
+            def __init__(self, chromium):
+                self.chromium = chromium
+
+        class _FakeAsyncPlaywright:
+            async def __aenter__(self):
+                return _FakePlaywright(chromium)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        fake_playwright_async_api = types.ModuleType("playwright.async_api")
+        fake_playwright_async_api.async_playwright = lambda: _FakeAsyncPlaywright()
+        fake_playwright_async_api.TimeoutError = TimeoutError
+
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.async_api = fake_playwright_async_api
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "playwright": fake_playwright,
+                    "playwright.async_api": fake_playwright_async_api,
+                },
+            ),
+            mock.patch.object(logistics_query, "begin_local_cdp_session", return_value=None),
+            mock.patch.object(logistics_query, "end_local_cdp_session"),
+            mock.patch.object(logistics_query, "get_local_cdp_endpoint", return_value="ws://127.0.0.1:19444/devtools/browser/demo"),
+            mock.patch.object(logistics_query, "apply_usps_browser_stealth", new=mock.AsyncMock()),
+            mock.patch.object(logistics_query, "extract_usps_tracking_items_from_html", return_value=parsed_items),
+            mock.patch.object(logistics_query, "_type_like_human", new=mock.AsyncMock(side_effect=TimeoutError("click blocked"))) as type_like_human_mock,
+        ):
+            result = await logistics_query.query_usps_tracking(tracking_no)
+
+        self.assertEqual(result["平台"], "USPS")
+        self.assertEqual(result["物流轨迹"], parsed_items)
+        type_like_human_mock.assert_awaited_once_with(fresh_page, "#tracking-input", tracking_no, delay_range=(90, 180))
+        fresh_page.evaluate.assert_awaited()
+        search_button.click.assert_awaited_once()
+        tracking_number.wait_for.assert_awaited_once()
+        fresh_page.close.assert_awaited_once()
+        fresh_context.close.assert_awaited_once()
+
     async def test_query_usps_tracking_waits_for_akamai_challenge_then_recovers(self):
         tracking_no = "9214490411372848389407"
         parsed_items = [{"时间": "2026-06-08", "内容": "Delivered", "地点": "TX"}]
@@ -597,6 +703,108 @@ class UspsQueryExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["平台"], "USPS")
         self.assertIn("输入框内容被截断", result["错误"])
         search_button.click.assert_not_awaited()
+
+    async def test_query_usps_tracking_accepts_direct_result_page_without_tracking_num_header(self):
+        tracking_no = "9434650105495028445440"
+        parsed_items = [{"时间": "2026-06-08", "内容": "Delivered", "地点": "TX"}]
+
+        search_input = SimpleNamespace(
+            wait_for=mock.AsyncMock(),
+            input_value=mock.AsyncMock(return_value=tracking_no),
+            count=mock.AsyncMock(return_value=1),
+            first=None,
+        )
+        search_input.first = search_input
+        search_button = SimpleNamespace(
+            wait_for=mock.AsyncMock(),
+            click=mock.AsyncMock(),
+            count=mock.AsyncMock(return_value=1),
+            first=None,
+        )
+        search_button.first = search_button
+        tracking_number = SimpleNamespace(
+            wait_for=mock.AsyncMock(side_effect=TimeoutError("missing tracking header")),
+            inner_text=mock.AsyncMock(return_value=""),
+            count=mock.AsyncMock(return_value=0),
+            first=None,
+        )
+        tracking_number.first = tracking_number
+
+        fresh_page = SimpleNamespace(
+            url=f"https://tools.usps.com/tracking/{tracking_no}",
+            goto=mock.AsyncMock(),
+            reload=mock.AsyncMock(),
+            wait_for_load_state=mock.AsyncMock(),
+            wait_for_timeout=mock.AsyncMock(),
+            wait_for_selector=mock.AsyncMock(),
+            wait_for_url=mock.AsyncMock(),
+            content=mock.AsyncMock(return_value=USPS_HTML),
+            bring_to_front=mock.AsyncMock(),
+            title=mock.AsyncMock(return_value="USPS Tracking"),
+            screenshot=mock.AsyncMock(),
+            close=mock.AsyncMock(),
+            locator=mock.Mock(
+                side_effect=lambda selector: (
+                    search_input
+                    if selector == "#tracking-input"
+                    else search_button
+                    if selector == "#trackBtn"
+                    else tracking_number
+                )
+            ),
+        )
+        fresh_context = SimpleNamespace(
+            pages=[],
+            new_page=mock.AsyncMock(return_value=fresh_page),
+            close=mock.AsyncMock(),
+        )
+        browser = SimpleNamespace(
+            contexts=[],
+            new_context=mock.AsyncMock(return_value=fresh_context),
+        )
+        chromium = SimpleNamespace(connect_over_cdp=mock.AsyncMock(return_value=browser))
+
+        class _FakePlaywright:
+            def __init__(self, chromium):
+                self.chromium = chromium
+
+        class _FakeAsyncPlaywright:
+            async def __aenter__(self):
+                return _FakePlaywright(chromium)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        fake_playwright_async_api = types.ModuleType("playwright.async_api")
+        fake_playwright_async_api.async_playwright = lambda: _FakeAsyncPlaywright()
+        fake_playwright_async_api.TimeoutError = TimeoutError
+
+        fake_playwright = types.ModuleType("playwright")
+        fake_playwright.async_api = fake_playwright_async_api
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "playwright": fake_playwright,
+                    "playwright.async_api": fake_playwright_async_api,
+                },
+            ),
+            mock.patch.object(logistics_query, "begin_local_cdp_session", return_value=None),
+            mock.patch.object(logistics_query, "end_local_cdp_session"),
+            mock.patch.object(logistics_query, "get_local_cdp_endpoint", return_value="ws://127.0.0.1:19444/devtools/browser/demo"),
+            mock.patch.object(logistics_query, "apply_usps_browser_stealth", new=mock.AsyncMock()),
+            mock.patch.object(logistics_query, "extract_usps_tracking_items_from_html", return_value=parsed_items),
+            mock.patch.object(logistics_query, "_type_like_human", new=mock.AsyncMock()),
+        ):
+            result = await logistics_query.query_usps_tracking(tracking_no)
+
+        self.assertEqual(result["平台"], "USPS")
+        self.assertEqual(result["物流轨迹"], parsed_items)
+        tracking_number.wait_for.assert_awaited_once()
+        search_button.click.assert_awaited_once()
+        fresh_page.close.assert_awaited_once()
+        fresh_context.close.assert_awaited_once()
 
 
 class TrackingCacheTests(unittest.IsolatedAsyncioTestCase):

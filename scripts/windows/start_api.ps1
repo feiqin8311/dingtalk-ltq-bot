@@ -49,6 +49,21 @@ function Resolve-SystemBrowser {
     return ""
 }
 
+function Resolve-AbsolutePath {
+    param(
+        [string]$PathValue,
+        [string]$BaseDir
+    )
+
+    if (-not $PathValue) {
+        return ""
+    }
+    if ([System.IO.Path]::IsPathRooted($PathValue)) {
+        return [System.IO.Path]::GetFullPath($PathValue)
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $BaseDir $PathValue))
+}
+
 function Test-CdpHttp {
     param([string]$CdpUrl)
     try {
@@ -56,6 +71,50 @@ function Test-CdpHttp {
         return [bool]$Response.webSocketDebuggerUrl
     } catch {
         return $false
+    }
+}
+
+function Write-CdpDiagnostics {
+    param(
+        [string]$CdpUrl,
+        [string]$BrowserPath,
+        [string[]]$BrowserArgs,
+        [System.Diagnostics.Process]$StartedProcess = $null
+    )
+
+    Write-Warning "CDP diagnostics:"
+    Write-Warning "  url=$CdpUrl"
+    Write-Warning "  browser=$BrowserPath"
+    Write-Warning "  user_data_dir=$($env:LOCAL_CDP_USER_DATA_DIR)"
+    Write-Warning "  args=$($BrowserArgs -join ' ')"
+    if ($StartedProcess) {
+        Write-Warning "  started_process_id=$($StartedProcess.Id)"
+        try {
+            Write-Warning "  started_process_has_exited=$($StartedProcess.HasExited)"
+        } catch {
+            Write-Warning "  started_process_has_exited=<unavailable>"
+        }
+    }
+
+    try {
+        $PortConnections = Get-NetTCPConnection -LocalPort ([int]$env:LOCAL_CDP_PORT) -ErrorAction Stop
+        if ($PortConnections) {
+            foreach ($Connection in $PortConnections) {
+                Write-Warning "  port_listener state=$($Connection.State) local=$($Connection.LocalAddress):$($Connection.LocalPort) remote=$($Connection.RemoteAddress):$($Connection.RemotePort) owning_pid=$($Connection.OwningProcess)"
+            }
+        } else {
+            Write-Warning "  port_listener=<none>"
+        }
+    } catch {
+        Write-Warning "  port_listener_check_failed=$($_.Exception.Message)"
+    }
+
+    try {
+        $Request = Invoke-WebRequest -Method Get -Uri (($CdpUrl.TrimEnd("/")) + "/json/version/") -TimeoutSec 2 -UseBasicParsing
+        Write-Warning "  http_status=$($Request.StatusCode)"
+        Write-Warning "  http_body=$($Request.Content)"
+    } catch {
+        Write-Warning "  http_probe_failed=$($_.Exception.Message)"
     }
 }
 
@@ -71,6 +130,7 @@ function Ensure-SharedCdp {
     if (-not $env:LOCAL_CDP_PORT) { $env:LOCAL_CDP_PORT = "19444" }
     if (-not $env:LOCAL_CDP_URL) { $env:LOCAL_CDP_URL = "http://$($env:LOCAL_CDP_HOST):$($env:LOCAL_CDP_PORT)" }
     if (-not $env:LOCAL_CDP_USER_DATA_DIR) { $env:LOCAL_CDP_USER_DATA_DIR = ".\data\chrome-cdp-windows" }
+    $env:LOCAL_CDP_USER_DATA_DIR = Resolve-AbsolutePath -PathValue $env:LOCAL_CDP_USER_DATA_DIR -BaseDir $ProjectDir
     $env:LOCAL_CDP_EXTERNAL_ONLY = "true"
 
     if (Test-CdpHttp -CdpUrl $env:LOCAL_CDP_URL) {
@@ -103,7 +163,7 @@ function Ensure-SharedCdp {
     if (($env:LOCAL_CDP_HEADLESS).ToLower() -in @("1", "true", "yes", "on")) {
         $Args = @("--headless=new") + $Args
     }
-    Start-Process -FilePath $env:LOCAL_CDP_BROWSER_BIN -ArgumentList $Args -WorkingDirectory $ProjectDir
+    $StartedProcess = Start-Process -FilePath $env:LOCAL_CDP_BROWSER_BIN -ArgumentList $Args -WorkingDirectory $ProjectDir -PassThru
 
     $Deadline = (Get-Date).AddSeconds(30)
     while ((Get-Date) -lt $Deadline) {
@@ -113,7 +173,8 @@ function Ensure-SharedCdp {
         }
         Start-Sleep -Milliseconds 500
     }
-    throw "Shared CDP did not become ready: $($env:LOCAL_CDP_URL)"
+    Write-CdpDiagnostics -CdpUrl $env:LOCAL_CDP_URL -BrowserPath $env:LOCAL_CDP_BROWSER_BIN -BrowserArgs $Args -StartedProcess $StartedProcess
+    throw "Shared CDP did not become ready: $($env:LOCAL_CDP_URL). Chrome may have attached to an existing profile without enabling remote debugging. Close all Chrome/Edge processes and remove LOCAL_CDP_USER_DATA_DIR: $($env:LOCAL_CDP_USER_DATA_DIR)"
 }
 
 $VenvPython = Join-Path $ProjectDir ".venv\Scripts\python.exe"

@@ -63,6 +63,14 @@ class StartScriptTests(unittest.TestCase):
         self.assertIn("scripts\\run_all.py", script_text)
         self.assertNotIn("Start-Process `\n    -FilePath $PythonExe `\n    -ArgumentList @(\"-m\", \"uvicorn\"", script_text)
 
+    def test_run_all_starts_owned_api_process_for_visible_logs(self):
+        project_dir = Path(__file__).resolve().parents[1]
+        script_text = (project_dir / "scripts" / "run_all.py").read_text(encoding="utf-8")
+
+        self.assertIn("'api': [python_exe, '-m', 'uvicorn', 'api_server:app'", script_text)
+        self.assertNotIn("existing API is ready", script_text)
+        self.assertNotIn("_is_existing_api_ready", script_text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,22 @@ class EntrypointWrapperTests(unittest.TestCase):
         self.assertIn("from integrations.gewechat.bootstrap import *", bootstrap_text)
         self.assertIn("from integrations.gewechat.webhook import *", webhook_text)
 
+    def test_windows_start_scripts_include_cdp_diagnostics_on_timeout(self):
+        project_dir = Path(__file__).resolve().parents[1]
+
+        for relative_path in (
+            "scripts/windows/start_all.ps1",
+            "scripts/windows/start_api.ps1",
+            "scripts/windows/start_bot.ps1",
+        ):
+            script_text = (project_dir / relative_path).read_text(encoding="utf-8")
+
+            self.assertIn("function Write-CdpDiagnostics", script_text)
+            self.assertIn("function Resolve-AbsolutePath", script_text)
+            self.assertIn("CDP diagnostics:", script_text)
+            self.assertIn("Get-NetTCPConnection", script_text)
+            self.assertIn("Chrome may have attached to an existing profile", script_text)
+
 
 if __name__ == "__main__":
     unittest.main()

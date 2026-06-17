@@ -221,7 +221,8 @@ class CdpProfileCleanupTests(unittest.TestCase):
         original_count = logistics_query._LOCAL_CDP_ACTIVE_SESSIONS
         logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = 2
         try:
-            with mock.patch.object(logistics_query, "unregister_local_cdp_session", side_effect=[(1, False), (0, True)]), \
+            with mock.patch.object(logistics_query, "LOCAL_CDP_STOP_WHEN_IDLE", True), \
+                 mock.patch.object(logistics_query, "unregister_local_cdp_session", side_effect=[(1, False), (0, True)]), \
                  mock.patch.object(logistics_query, "stop_local_cdp_browser") as stop_mock:
                 logistics_query.end_local_cdp_session(None)
                 stop_mock.assert_not_called()
@@ -256,10 +257,25 @@ class CdpProfileCleanupTests(unittest.TestCase):
         original_count = logistics_query._LOCAL_CDP_ACTIVE_SESSIONS
         logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = 1
         try:
-            with mock.patch.object(logistics_query, "unregister_local_cdp_session", return_value=(0, False)), \
+            with mock.patch.object(logistics_query, "LOCAL_CDP_STOP_WHEN_IDLE", False), \
+                 mock.patch.object(logistics_query, "unregister_local_cdp_session", return_value=(0, False)), \
                  mock.patch.object(logistics_query, "stop_local_cdp_browser") as stop_mock:
                 logistics_query.end_local_cdp_session(None)
                 stop_mock.assert_not_called()
+        finally:
+            logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = original_count
+
+    def test_end_local_cdp_session_shared_local_browser_stops_when_idle(self):
+        original_count = logistics_query._LOCAL_CDP_ACTIVE_SESSIONS
+        logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = 1
+        try:
+            with mock.patch.object(logistics_query, "LOCAL_CDP_STOP_WHEN_IDLE", True), \
+                 mock.patch.object(logistics_query, "LOCAL_CDP_HOST", "127.0.0.1"), \
+                 mock.patch.object(logistics_query, "unregister_local_cdp_session", return_value=(0, False)), \
+                 mock.patch.object(logistics_query, "stop_local_cdp_browser") as stop_mock:
+                logistics_query.end_local_cdp_session(None)
+
+            stop_mock.assert_called_once_with(None)
         finally:
             logistics_query._LOCAL_CDP_ACTIVE_SESSIONS = original_count
 
