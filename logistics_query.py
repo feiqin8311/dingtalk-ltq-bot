@@ -67,6 +67,8 @@ LOCAL_CDP_STOP_WHEN_IDLE = os.environ.get('LOCAL_CDP_STOP_WHEN_IDLE', 'false').s
 
 logger = logging.getLogger(__name__)
 
+CHINA_TIMEZONE = timezone(timedelta(hours=8), name='GMT+8')
+
 _LOCAL_CDP_SESSION_LOCK = threading.Lock()
 _LOCAL_CDP_ACTIVE_SESSIONS = 0
 
@@ -241,7 +243,7 @@ def normalize_compare_text(value: Any) -> str:
 
 
 def format_timestamp_ms(value: int) -> str:
-    return datetime.fromtimestamp(value / 1000, tz=UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+    return datetime.fromtimestamp(value / 1000, tz=CHINA_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S GMT+8')
 
 
 def normalize_field_value(value: Any) -> Any:

@@ -5,6 +5,14 @@ import logistics_query
 
 
 class DingtalkSheetAccessTests(unittest.TestCase):
+    def test_timestamp_fields_are_formatted_in_china_time(self):
+        timestamp_ms = 1790006400000
+
+        self.assertEqual(
+            logistics_query.format_timestamp_ms(timestamp_ms),
+            "2026-09-22 00:00:00 GMT+8",
+        )
+
     def test_iter_search_sheets_fetches_sheet_list_once(self):
         sheets = [
             {"id": "sheet-1", "name": "2025New!"},
