@@ -34,7 +34,12 @@ class TrackingQueryRequest(BaseModel):
 
 
 class FbaQueryRequest(BaseModel):
-    fba_code: str = Field(..., description="要查询的 FBA 编号")
+    fba_code: str | None = Field(default=None, description="要查询的 FBA 编号；直接龙舟查询时可不传")
+    logistics_no: str | None = Field(
+        default=None,
+        description="直接查询的物流编号；传入后跳过钉钉表格并固定使用龙舟 AGL 查询",
+    )
+    brand: str | None = Field(default=None, description="直接龙舟查询的品牌，用于选择对应 AGL 账号")
     platform: str = Field(default="auto", description="指定平台，默认 auto")
     include_order: bool = Field(default=True, description="是否返回钉钉表匹配记录")
     include_tracking: bool = Field(default=True, description="是否继续查询物流轨迹")

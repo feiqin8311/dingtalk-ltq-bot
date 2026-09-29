@@ -63,19 +63,11 @@ API_PORT=18081
 API_AUTH_TOKEN=本机API使用的令牌
 ```
 
-启动本机 API:
+启动 Windows 执行节点（会同时启动本机 API 和机器人）:
 
-```powershell
-.\scripts\windows\start_api.ps1
-```
+直接双击项目根目录的 `start_all.bat`。
 
-Linux / WSL:
-
-```bash
-bash ./scripts/linux/start_api.sh
-```
-
-Windows 建议使用 `.env.windows.example` 作为起始模板；Linux / WSL 建议使用 `.env.linux.example`。
+Windows 建议使用 `.env.windows.example` 作为起始模板。
 
 ## 三、优先方案: Tailscale 直连上游
 
@@ -91,31 +83,7 @@ Windows 建议使用 `.env.windows.example` 作为起始模板；Linux / WSL 建
 curl http://100.99.40.87:18081/api/health
 ```
 
-## 四、备用方案: 本机建立反向 SSH 隧道
-
-Windows PowerShell:
-
-```powershell
-$env:SERVER_HOST="121.41.4.126"
-$env:SERVER_USER="root"
-$env:REMOTE_BIND_PORT="18781"
-$env:LOCAL_API_PORT="18081"
-.\scripts\start_reverse_tunnel.ps1
-```
-
-Linux / WSL:
-
-```bash
-SERVER_HOST=121.41.4.126 \
-SERVER_USER=root \
-REMOTE_BIND_PORT=18781 \
-LOCAL_API_PORT=18081 \
-bash scripts/start_reverse_tunnel.sh
-```
-
-这个隧道会把服务器上的 `127.0.0.1:18781` 转发到本机 `127.0.0.1:18081`。
-
-## 五、外部调用方式
+## 四、外部调用方式
 
 查询跟踪号:
 
@@ -133,6 +101,26 @@ curl -X POST "http://121.41.4.126:18743/api/fba/query" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: 对外调用网关时使用的令牌" \
   -d '{"fba_code":"FBA123456","platform":"auto","include_order":true,"include_tracking":true}'
+```
+
+直接使用物流编号查询龙舟（不会读取钉钉表格）:
+
+```bash
+curl -X POST "http://121.41.4.126:18743/api/fba/query" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: 对外调用网关时使用的令牌" \
+  -d '{"fba_code":"FBA123456","logistics_no":"AL0-UC54XYYFYNEW2","brand":"YPLUS","platform":"agl"}'
+```
+
+ `fba_code` 在该模式仅用于原样回显，可以省略。`brand` 可省略；省略时使用龙舟默认账号，YPLUS、EZARC、TOLESA 应传对应品牌以选用其专属账号。
+
+如果盈和没有 FBA 编号，可以直接使用物流编号查询，跳过钉钉表格：
+
+```bash
+curl -X POST "http://121.41.4.126:18743/api/fba/query" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: 对外调用网关时使用的令牌" \
+  -d '{"logistics_no":"YHE2605211007","platform":"yinghe","include_tracking":true}'
 ```
 
 ## 六、建议

@@ -8,6 +8,12 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from services.runtime_artifacts import cleanup_tmp_artifacts, runtime_log_path
+
 
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -22,12 +28,15 @@ REQUIRED_MODULES = {
 
 
 def _append_runtime_event(project_dir: Path, message: str) -> None:
-    log_dir = project_dir / 'runtime'
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / 'run_all-exit.log'
+    log_path = runtime_log_path(project_dir)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with log_path.open('a', encoding='utf-8') as handle:
         handle.write(f'[{timestamp}] {message}\n')
+
+
+def cleanup_runtime_artifacts(project_dir: Path, retention_days: int = 7) -> int:
+    return cleanup_tmp_artifacts(project_dir, retention_days=retention_days)
 
 
 def _missing_modules() -> list[str]:
@@ -105,10 +114,15 @@ def main() -> int:
 
     project_dir = Path(__file__).resolve().parents[1]
     python_exe = sys.executable
+    retention_days = int(os.environ.get('TMP_RETENTION_DAYS', '7') or '7')
     env = os.environ.copy()
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     env['PYTHONUTF8'] = '1'
+
+    removed_count = cleanup_runtime_artifacts(project_dir, retention_days=retention_days)
+    if removed_count:
+        print(f'[run] cleaned tmp artifacts: removed={removed_count} retention_days={retention_days}', flush=True)
 
     startup_messages = [
         f'[run] project directory: {project_dir}',

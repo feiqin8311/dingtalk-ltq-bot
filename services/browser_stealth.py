@@ -9,14 +9,15 @@ async def apply_browser_stealth(context, page, platform: str = '', logger=None) 
     normalized_platform = clean_text(platform).upper()
 
     try:
-        await context.set_extra_http_headers(
-            {
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-CH-UA-Platform': '"Windows"',
-                'Sec-CH-UA-Mobile': '?0',
-            }
-        )
+        headers = {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-CH-UA-Platform': '"Windows"',
+            'Sec-CH-UA-Mobile': '?0',
+        }
+        if normalized_platform == 'USPS':
+            headers['Referer'] = 'https://www.usps.com/'
+        await context.set_extra_http_headers(headers)
     except Exception:
         pass
 
@@ -96,6 +97,11 @@ async def apply_browser_stealth(context, page, platform: str = '', logger=None) 
                     : originalQuery(parameters)
                 );
               }
+              const originalResolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
+              Intl.DateTimeFormat.prototype.resolvedOptions = function(...args) {
+                const result = originalResolvedOptions.apply(this, args);
+                return { ...result, timeZone: 'America/Los_Angeles' };
+              };
             })();
             """
         )

@@ -78,6 +78,35 @@ AMAZON_UK_SUMMARY_HTML = """
 </section>
 """
 
+AMAZON_UK_DELIVERED_WITHOUT_LOCATION_HTML = """
+<div>
+  <div class="css-dsf1ob">
+    <h3 class="css-p7vi71" mdn-text=""><span>Shipped with Amazon Shipping</span></h3>
+    <h5 class="css-176mvq0" mdn-text=""><span>Tracking ID : UK4459561227</span></h5>
+    <div class="css-1xz1o3r"><p class="css-1bhbd4d" mdn-text="">Friday, 19 June</p></div>
+    <div class="css-193enz3">
+      <div class="css-dsf1ob"><p class="css-1bhbd4d" mdn-text="">20:30</p></div>
+      <div class="css-dsf1ob"><p class="css-1bhbd4d _3jMMC2" mdn-text=""><div class="css-1xz1o3r">Label Created</div><div class="css-1xz1o3r"><i>Mansfield, East Midlands, UK</i></div></p></div>
+    </div>
+    <div class="css-193enz3">
+      <div class="css-dsf1ob"><p class="css-1bhbd4d" mdn-text="">20:30</p></div>
+      <div class="css-dsf1ob"><p class="css-1bhbd4d _3jMMC2" mdn-text=""><div class="css-1xz1o3r">Package arrived at the carrier facility</div><div class="css-1xz1o3r"><i>Mansfield, East Midlands, UK</i></div></p></div>
+    </div>
+    <div class="css-1xz1o3r"><p class="css-1bhbd4d" mdn-text="">Saturday, 20 June</p></div>
+    <div class="css-193enz3">
+      <div class="css-dsf1ob"><p class="css-1bhbd4d" mdn-text="">19:47</p></div>
+      <div class="css-dsf1ob"><p class="css-1bhbd4d _3jMMC2" mdn-text=""><div class="css-1xz1o3r">Package has left the carrier facility</div><div class="css-1xz1o3r"><i>HAVANT, South East England, UK</i></div></p></div>
+    </div>
+    <div class="css-1xz1o3r"><p class="css-1bhbd4d" mdn-text="">Sunday, 21 June</p></div>
+    <div class="css-193enz3">
+      <div class="css-dsf1ob"><p class="css-1bhbd4d" mdn-text="">03:03</p></div>
+      <div class="css-dsf1ob"><p class="css-1bhbd4d _3jMMC2" mdn-text=""><div class="css-1xz1o3r">Package delivered</div></p></div>
+    </div>
+    <p class="css-1bhbd4d" mdn-text=""><i>Times are shown in the local timezone</i></p>
+  </div>
+</div>
+"""
+
 
 class AmazonUkQueryParsingTests(unittest.TestCase):
     def test_extract_amazon_uk_summary(self):
@@ -98,6 +127,12 @@ class AmazonUkQueryParsingTests(unittest.TestCase):
                 {"时间": "6月8日，星期一 19:34", "内容": "包裹已到达承运商仓库", "地点": "英国伯明翰萨顿科尔菲尔德"},
                 {"时间": "6月8日，星期一 19:34", "内容": "标签已创建", "地点": "英国伯明翰萨顿科尔菲尔德"},
             ],
+        )
+
+    def test_extract_amazon_uk_tracking_items_keeps_delivered_row_without_location(self):
+        self.assertEqual(
+            extract_amazon_uk_tracking_items_from_html(AMAZON_UK_DELIVERED_WITHOUT_LOCATION_HTML)[0],
+            {"时间": "Sunday, 21 June 03:03", "内容": "Package delivered", "地点": ""},
         )
 
 

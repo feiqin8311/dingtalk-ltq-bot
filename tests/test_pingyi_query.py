@@ -6,6 +6,117 @@ from unittest import mock
 import logistics_query
 
 
+class PingyiSearchResultParserTests(unittest.TestCase):
+    def test_extracts_track_id_from_tracking_link_matching_fba_order_id(self):
+        html = """
+        <table>
+          <tr>
+            <td><a class="acss" href="javascript:void(0);" onclick="showtrackdialog('11111','PY0000000000');">PY0000000000</a></td>
+          </tr>
+          <tr>
+            <td><a class="acss" href="javascript:void(0);" onclick="showdialog('32962','FBA19FDPK8TT');">FBA19FDPK8TT</a></td>
+          </tr>
+          <tr>
+            <td><a class="acss" href="javascript:void(0);" onclick="showtrackdialog('32962','PY1196333960');">PY1196333960</a></td>
+          </tr>
+        </table>
+        """
+
+        bs_id = logistics_query._extract_pingyi_track_bs_id(html, "FBA19FDPK8TT")
+
+        self.assertEqual(bs_id, "32962")
+
+    def test_extracts_track_id_when_fba_is_in_result_row_not_dialog_argument(self):
+        html = """
+        <table>
+          <tr>
+            <td>FBA19FDPK8TT</td>
+            <td>PY202607020001</td>
+            <td><a onclick="showtrackdialog('98765','PY202607020001')">轨迹</a></td>
+          </tr>
+        </table>
+        """
+
+        bs_id = logistics_query._extract_pingyi_track_bs_id(html, "FBA19FDPK8TT")
+
+        self.assertEqual(bs_id, "98765")
+
+
+class _PingyiApiResponse:
+    def __init__(self, payload):
+        self.payload = payload
+        self.raise_for_status = mock.Mock()
+
+    def json(self):
+        return self.payload
+
+
+class PingyiApiTests(unittest.IsolatedAsyncioTestCase):
+    def _get_env(self, name):
+        return {
+            'PINGYI_APP_TOKEN': 'app-token',
+            'PINGYI_APP_KEY': 'app-key',
+        }[name]
+
+    def test_get_track_posts_expected_form_and_normalizes_details(self):
+        response = _PingyiApiResponse({
+            'success': True,
+            'data': [{
+                'tracking_number': 'PY123456789',
+                'details': [
+                    {
+                        'track_occur_date': '2026-08-02 10:00:00',
+                        'track_description': '已到港',
+                        'track_location': 'Los Angeles',
+                        'track_code': 'ARRIVED',
+                    },
+                    {
+                        'track_occur_date': '2026-08-03 10:00:00',
+                        'track_description': '已签收',
+                    },
+                ],
+            }],
+        })
+
+        with mock.patch.dict('os.environ', {'PINGYI_BASE_URL': 'http://api.example.test', 'PINGYI_API_TIMEOUT_SECONDS': '15'}, clear=False), \
+             mock.patch.object(logistics_query, 'get_env', side_effect=self._get_env), \
+             mock.patch.object(logistics_query.requests, 'post', return_value=response) as post_mock:
+            record = logistics_query.query_pingyi_api('FBA123456')
+
+        post_mock.assert_called_once_with(
+            'http://api.example.test/webservice/PublicService.asmx/ServiceInterfaceUTF8',
+            data={
+                'appToken': 'app-token',
+                'appKey': 'app-key',
+                'serviceMethod': 'getTrack',
+                'paramsJson': '{"tracking_number":"FBA123456"}',
+            },
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=15,
+        )
+        tracks = logistics_query.normalize_pingyi_track_items(record)
+        self.assertEqual(tracks[0]['内容'], '已签收')
+        self.assertEqual(tracks[1]['地点'], 'Los Angeles')
+        self.assertEqual(tracks[1]['状态代码'], 'ARRIVED')
+
+    def test_get_track_returns_none_when_api_reports_number_does_not_exist(self):
+        response = _PingyiApiResponse({'success': False, 'message': '该单号不存在'})
+
+        with mock.patch.object(logistics_query, 'get_env', side_effect=self._get_env), \
+             mock.patch.object(logistics_query.requests, 'post', return_value=response):
+            record = logistics_query.query_pingyi_api('FBA123456')
+
+        self.assertIsNone(record)
+
+    async def test_query_pingyi_returns_structured_error_for_request_failure(self):
+        with mock.patch.object(logistics_query, 'query_pingyi_api', side_effect=RuntimeError('连接超时')):
+            result = await logistics_query.query_pingyi('FBA123456')
+
+        self.assertEqual(result['平台'], '平谊')
+        self.assertEqual(result['物流轨迹'], [])
+        self.assertEqual(result['错误'], '连接超时')
+
+
 class _AsyncLocator:
     def __init__(self, screenshot_bytes=b"fake"):
         self.fill = mock.AsyncMock()

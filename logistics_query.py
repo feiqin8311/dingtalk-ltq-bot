@@ -14,20 +14,23 @@ import threading
 import time
 import zipfile
 from urllib.parse import quote, urlparse, urlunparse
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
 import requests
+from integrations.ziniao.client import get_ziniao_webdriver_client
 from qq_query import query_qq
 from services import browser_state as browser_state_service
 from services import browser_stealth as browser_stealth_service
+from services import runtime_artifacts as runtime_artifacts_service
 from services import tracking_providers as tracking_providers_service
 from services import tracking_runtime as tracking_runtime_service
 
 ENV_PATH = Path(__file__).with_name('.env')
+PROJECT_DIR = ENV_PATH.parent
 
 
 def _preload_env(path: Path = ENV_PATH) -> None:
@@ -53,6 +56,7 @@ DINGTALK_TARGET_SHEET_NAME = os.environ.get('DINGTALK_TARGET_SHEET_NAME', '2025N
 DINGTALK_OPERATOR_ID = os.environ.get('DINGTALK_OPERATOR_ID', 'UQrqqgBXryxyFbP7kGAfdAiEiE')
 AGL_LOGIN_URL = 'https://www.agl.amazon.com/freight-puma'
 AGL_TRACKING_URL = 'https://www.agl.amazon.com/freight-puma/shipment/{booking_id}/tracking'
+YINGHE_URL = 'http://www.gjwl.yhwl.com:8027/'
 LOCAL_CDP_HOST = os.environ.get('LOCAL_CDP_HOST', '127.0.0.1')
 LOCAL_CDP_PORT = int(os.environ.get('LOCAL_CDP_PORT', '19444'))
 LOCAL_CDP_URL = os.environ.get('LOCAL_CDP_URL', f'http://{LOCAL_CDP_HOST}:{LOCAL_CDP_PORT}')
@@ -64,6 +68,7 @@ LOCAL_CDP_BROWSER_BIN = os.environ.get('LOCAL_CDP_BROWSER_BIN', '').strip()
 LOCAL_CDP_HEADLESS = os.environ.get('LOCAL_CDP_HEADLESS', '').strip().lower() in {'1', 'true', 'yes', 'on'}
 LOCAL_CDP_EXTERNAL_ONLY = os.environ.get('LOCAL_CDP_EXTERNAL_ONLY', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
 LOCAL_CDP_STOP_WHEN_IDLE = os.environ.get('LOCAL_CDP_STOP_WHEN_IDLE', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+AGL_SESSION_STATE_DIR = Path(os.environ.get('AGL_SESSION_STATE_DIR', str(PROJECT_DIR / 'data' / 'agl-sessions')))
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +84,6 @@ _DINGTALK_TOKEN_CACHE: dict[str, Any] = {
 
 SERIAL_BROWSER_TRACKING_PLATFORMS = {
     'agl',
-    'pingyi',
     'baosen',
     '17track',
     '17track_en',
@@ -91,6 +95,7 @@ SERIAL_BROWSER_TRACKING_PLATFORMS = {
     'amazon_uk',
     'swiship_ca',
     'amazon_us',
+    'yinghe',
 }
 _TRACKING_QUERY_CACHE = tracking_runtime_service.TRACKING_QUERY_CACHE
 _BROWSER_TRACKING_QUEUE_STATE = tracking_runtime_service.BROWSER_TRACKING_QUEUE_STATE
@@ -106,6 +111,22 @@ def _local_cdp_state_path() -> Path:
 
 def _local_cdp_lock_path() -> Path:
     return browser_state_service.local_cdp_lock_path(os.name, LOCAL_CDP_PORT)
+
+
+def _project_tmp_dir() -> Path:
+    return runtime_artifacts_service.project_tmp_dir(PROJECT_DIR)
+
+
+def _local_cdp_pid_path() -> Path:
+    return runtime_artifacts_service.cdp_pid_path(PROJECT_DIR, LOCAL_CDP_PORT)
+
+
+def _build_platform_debug_dir(platform: str, day: str) -> Path:
+    return runtime_artifacts_service.debug_dir(PROJECT_DIR, platform=platform, day=day)
+
+
+def _build_platform_download_dir(platform: str, day: str) -> Path:
+    return runtime_artifacts_service.download_dir(PROJECT_DIR, platform=platform, day=day)
 
 
 def load_local_cdp_state() -> dict[str, Any]:
@@ -437,27 +458,82 @@ def record_matches_target(normalized: dict[str, Any], target: str) -> bool:
     return target in blob
 
 
-def get_primary_logistics_no(order: dict[str, Any] | None) -> str:
+def get_logistics_nos(order: dict[str, Any] | None) -> list[str]:
     if not order:
-        return ''
+        return []
 
     raw_source = str(order.get('物流编号', '') or '')
     raw_value = clean_text(raw_source)
     if not raw_value or raw_value == '/':
-        return ''
+        return []
 
     matched_codes = re.findall(r'[A-Za-z]{2,}\d{6,}', raw_source)
     if matched_codes:
-        return clean_text(matched_codes[0])
+        values = [clean_text(item) for item in matched_codes]
+    else:
+        values = [
+            clean_text(item)
+            for item in re.split(r'[\s,，;；|｜/]+', raw_source)
+            if clean_text(item) and clean_text(item) != '/'
+        ]
 
-    parts = [
-        clean_text(item)
-        for item in re.split(r'[\s,，;；|｜/]+', raw_source)
-        if clean_text(item) and clean_text(item) != '/'
-    ]
-    if parts:
-        return parts[0]
-    return raw_value
+    if not values:
+        values = [raw_value]
+
+    unique_values: list[str] = []
+    for value in values:
+        if value and value not in unique_values:
+            unique_values.append(value)
+    return unique_values
+
+
+def get_primary_logistics_no(order: dict[str, Any] | None) -> str:
+    logistics_nos = get_logistics_nos(order)
+    return logistics_nos[0] if logistics_nos else ''
+
+
+def combine_tracking_results_by_logistics_no(
+    platform: str,
+    results: list[tuple[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    """Preserve per-number tracking results while retaining legacy aggregate fields."""
+    per_number_results: list[dict[str, Any]] = []
+    aggregate_tracks: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for logistics_no, raw_result in results:
+        result = dict(raw_result or {})
+        tracks = []
+        for raw_track in result.get('物流轨迹') or []:
+            if not isinstance(raw_track, dict):
+                continue
+            track = dict(raw_track)
+            track.setdefault('单号', logistics_no)
+            tracks.append(track)
+            aggregate_tracks.append(track)
+
+        result['平台'] = str(result.get('平台', platform) or platform)
+        result['查询值'] = logistics_no
+        result['物流轨迹'] = tracks
+        result['最新轨迹'] = tracks[0] if tracks else {}
+        result['物流编号'] = logistics_no
+        per_number_results.append(result)
+
+        error = clean_text(result.get('错误', ''))
+        if error:
+            errors.append(f'{logistics_no}: {error}')
+
+    aggregate_tracks = sort_tracks_newest_first(aggregate_tracks)
+    combined = {
+        '平台': platform,
+        '查询值': ','.join(logistics_no for logistics_no, _ in results),
+        '物流编号查询结果': per_number_results,
+        '物流轨迹': aggregate_tracks,
+        '最新轨迹': aggregate_tracks[0] if aggregate_tracks else {},
+    }
+    if per_number_results and len(errors) == len(per_number_results):
+        combined['错误'] = '；'.join(errors)
+    return combined
 
 
 def find_order_by_fba(fba_code: str) -> dict[str, Any] | None:
@@ -569,18 +645,32 @@ def set_agl_language_to_zh(page) -> str:
     if click_if_visible(page, menu_selectors):
         page.wait_for_timeout(800)
         if click_if_visible(page, option_selectors, timeout=3000):
-            page.wait_for_load_state('networkidle')
             return '简体中文'
     if any(page.locator(selector).count() > 0 for selector in current_language_selectors):
         return '简体中文'
     return clean_text(page.locator('html').get_attribute('lang') or '')
 
 
-def extract_agl_tracking(page) -> list[dict[str, str]]:
+def get_agl_tracker_text(page) -> str:
+    """Read the optional AGL timeline without waiting for a missing component."""
     tracker_root = page.locator('.kat-progress-tracker').first
     try:
-        if tracker_root.count() > 0:
-            raw_lines = [dedupe_repeated_text(line) for line in tracker_root.first.inner_text().splitlines()]
+        if tracker_root.count() == 0:
+            return ''
+        try:
+            return str(tracker_root.inner_text(timeout=1500) or '').strip()
+        except TypeError:
+            # Keeps the helper compatible with the lightweight test locators.
+            return str(tracker_root.inner_text() or '').strip()
+    except Exception:
+        return ''
+
+
+def extract_agl_tracking(page) -> list[dict[str, str]]:
+    tracker_text = get_agl_tracker_text(page)
+    try:
+        if tracker_text:
+            raw_lines = [dedupe_repeated_text(line) for line in tracker_text.splitlines()]
             lines = [line for line in raw_lines if line]
             section_headers = {
                 '已预订', '装货港口', '运输途中', '卸货港口', '正在配送', '已配送至亚马逊运营中心'
@@ -675,9 +765,8 @@ def extract_agl_tracking(page) -> list[dict[str, str]]:
         if items:
             return items
 
-    tracker_text = clean_text(page.locator('.kat-progress-tracker').first.inner_text())
     if tracker_text:
-        return [{'时间': '', '内容': tracker_text[:2000]}]
+        return [{'时间': '', '内容': clean_text(tracker_text)[:2000]}]
     return []
 
 
@@ -687,7 +776,7 @@ def wait_for_agl_tracking_stability(page, wait_ms: int = 1500, max_checks: int =
 
     for index in range(max_checks):
         latest_tracks = sort_tracks_newest_first(extract_agl_tracking(page))
-        snapshot = clean_text(page.locator('.kat-progress-tracker').first.inner_text())
+        snapshot = clean_text(get_agl_tracker_text(page))
 
         if latest_tracks and not snapshot:
             return latest_tracks
@@ -705,10 +794,18 @@ def wait_for_agl_tracking_stability(page, wait_ms: int = 1500, max_checks: int =
 def get_agl_credentials(order: dict[str, Any]) -> tuple[str, str, str]:
     brand = clean_text(order.get('品牌', ''))
     if brand.upper() in {'TOLESA', 'EZARC'}:
+        if clean_text(os.environ.get('AGL_EASYCAN_ZINIAO_BROWSER_ID', '')):
+            return '', '', 'AGL_EASYCAN_ZINIAO'
         return (
             normalize_agl_username(get_env('AGL_EASYCAN_USERNAME')),
             get_env('AGL_EASYCAN_PASSWORD'),
             'AGL_EASYCAN',
+        )
+    if brand.upper() == 'YPLUS':
+        return (
+            normalize_agl_username(get_env('AGL_YPLUS_USERNAME')),
+            get_env('AGL_YPLUS_PASSWORD'),
+            'AGL_YPLUS',
         )
     return (
         normalize_agl_username(get_env('AGL_USERNAME')),
@@ -717,18 +814,50 @@ def get_agl_credentials(order: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def get_agl_session_state_path(credential_source: str) -> Path:
+    source = re.sub(r'[^A-Za-z0-9_-]+', '_', clean_text(credential_source)).strip('_').lower()
+    if not source:
+        raise ValueError('AGL 账号来源不能为空')
+    return AGL_SESSION_STATE_DIR / f'{source}.json'
+
+
+def get_agl_manual_verification_wait_seconds() -> int:
+    raw_value = os.environ.get('AGL_MANUAL_VERIFICATION_WAIT_SECONDS', '120').strip()
+    try:
+        return max(30, min(600, int(raw_value)))
+    except ValueError:
+        return 120
+
+
+def get_agl_tracking_render_wait_seconds() -> int:
+    raw_value = os.environ.get('AGL_TRACKING_RENDER_WAIT_SECONDS', '30').strip()
+    try:
+        return max(10, min(60, int(raw_value)))
+    except ValueError:
+        return 30
+
+
+def wait_for_agl_tracking_render(page) -> list[dict[str, str]]:
+    wait_ms = 1500
+    timeout_ms = get_agl_tracking_render_wait_seconds() * 1000
+    max_checks = max(2, (timeout_ms + wait_ms - 1) // wait_ms)
+    return wait_for_agl_tracking_stability(page, wait_ms=wait_ms, max_checks=max_checks)
+
+
 def create_agl_page(playwright, credential_source: str, headless: bool):
     browser = playwright.chromium.connect_over_cdp(get_local_cdp_endpoint())
-    contexts = browser.contexts
-    context = contexts[0] if contexts else browser.new_context(
-        viewport={'width': 1440, 'height': 960},
-        locale='zh-CN',
-        timezone_id='Asia/Shanghai',
-    )
-    try:
-        context.clear_cookies()
-    except Exception:
-        pass
+    session_state_path = get_agl_session_state_path(credential_source)
+    context_options = {
+        'viewport': {'width': 1440, 'height': 960},
+        'locale': 'zh-CN',
+        'timezone_id': 'Asia/Shanghai',
+    }
+    if session_state_path.is_file():
+        context_options['storage_state'] = str(session_state_path)
+        logger.info('AGL 查询: 加载已保存会话 账号来源=%s', credential_source)
+    else:
+        logger.info('AGL 查询: 未找到已保存会话，将进行首次登录 账号来源=%s', credential_source)
+    context = browser.new_context(**context_options)
     try:
         context.add_init_script(
             """
@@ -768,7 +897,37 @@ def create_agl_page(playwright, credential_source: str, headless: bool):
         pass
 
     def cleanup():
+        try:
+            page.close()
+        except Exception:
+            pass
+        try:
+            context.close()
+        except Exception:
+            pass
         browser.close()
+
+    return browser, context, page, cleanup
+
+
+def create_ziniao_agl_page(playwright, debugging_port: int | str):
+    """Reuse Ziniao's existing page without taking ownership of its environment."""
+    browser = playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{debugging_port}')
+    if not browser.contexts:
+        browser.close()
+        raise RuntimeError('紫鸟浏览器未提供可用的 Playwright context')
+    context = browser.contexts[0]
+    page = context.pages[0] if context.pages else context.new_page()
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    def cleanup():
+        # The Playwright root disconnects on exit. Calling browser.close() here
+        # or page.close() here would alter the real Ziniao environment.
+        # Deliberately do nothing.
+        return None
 
     return browser, context, page, cleanup
 
@@ -883,7 +1042,8 @@ def ensure_local_cdp_browser():
     )
 
     if LOCAL_CDP_HOST in {'127.0.0.1', 'localhost'}:
-        pid_file = Path(f'/tmp/dingtalk-ltq-cdp-{LOCAL_CDP_PORT}.pid')
+        pid_file = _local_cdp_pid_path()
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
         try:
             pid_file.write_text(str(process.pid), encoding='utf-8')
         except OSError as exc:
@@ -1025,7 +1185,7 @@ def stop_local_cdp_browser(process: subprocess.Popen | None = None) -> None:
     if LOCAL_CDP_HOST not in {'127.0.0.1', 'localhost'}:
         return
 
-    pid_file = Path(f'/tmp/dingtalk-ltq-cdp-{LOCAL_CDP_PORT}.pid')
+    pid_file = _local_cdp_pid_path()
     pid = ''
     if pid_file.exists():
         try:
@@ -1201,7 +1361,287 @@ def _is_agl_signin_page(page) -> bool:
     return 'signin' in page.url.lower()
 
 
-def _retry_agl_tracking_fetch(page, tracking_url: str) -> list[dict[str, str]]:
+def _is_agl_mfa_page(page) -> bool:
+    return 'ap/mfa' in page.url.lower() or page.get_by_text('Two-Step Verification', exact=False).count() > 0
+
+
+def _is_agl_login_pending(page) -> bool:
+    return _is_agl_signin_page(page) or _is_agl_mfa_page(page)
+
+
+def _locator_is_visible(locator) -> bool:
+    try:
+        return bool(locator.is_visible(timeout=1500))
+    except TypeError:
+        return bool(locator.is_visible())
+    except Exception:
+        return False
+
+
+def _locator_count(locator) -> int:
+    try:
+        return int(locator.count())
+    except Exception:
+        return 0
+
+
+def _get_ziniao_confirmation_pages(page, context=None) -> list[Any]:
+    """Return the AGL page and any Ziniao-created pages in the same context."""
+    resolved_context = context
+    if resolved_context is None:
+        try:
+            resolved_context = page.context
+        except Exception:
+            resolved_context = None
+
+    pages = [page]
+    try:
+        pages.extend(resolved_context.pages if resolved_context is not None else [])
+    except Exception:
+        pass
+
+    unique_pages: list[Any] = []
+    seen_page_ids: set[int] = set()
+    for candidate in pages:
+        if candidate is None or id(candidate) in seen_page_ids:
+            continue
+        seen_page_ids.add(id(candidate))
+        unique_pages.append(candidate)
+    return unique_pages
+
+
+def _get_ziniao_confirmation_surfaces(page, context=None) -> list[Any]:
+    """Include child frames because hosted Passkey UI may be iframe-based."""
+    surfaces: list[Any] = []
+    seen_surface_ids: set[int] = set()
+    for candidate_page in _get_ziniao_confirmation_pages(page, context=context):
+        candidates = [candidate_page]
+        try:
+            frames = candidate_page.frames
+            if callable(frames):
+                frames = frames()
+            candidates.extend(frames or [])
+        except Exception:
+            pass
+        for candidate in candidates:
+            if candidate is None or id(candidate) in seen_surface_ids:
+                continue
+            seen_surface_ids.add(id(candidate))
+            surfaces.append(candidate)
+    return surfaces
+
+
+def _click_ziniao_passkey_button(page, context=None) -> bool:
+    for candidate in _get_ziniao_confirmation_surfaces(page, context=context):
+        passkey_button = candidate.locator('button#dialog-btn-0').first
+        if _locator_count(passkey_button) == 0 or not _locator_is_visible(passkey_button):
+            continue
+        try:
+            try:
+                passkey_button.click(timeout=5000)
+            except TypeError:
+                passkey_button.click()
+            except Exception:
+                try:
+                    passkey_button.click(timeout=5000, force=True)
+                except TypeError:
+                    passkey_button.click(force=True)
+            logger.info(
+                '紫鸟 AGL: 已点击 Passkey 登录按钮 page_url=%s',
+                getattr(candidate, 'url', ''),
+            )
+            return True
+        except Exception as exc:
+            logger.warning('紫鸟 AGL: 点击 Passkey 登录按钮失败 page_url=%s error=%s', getattr(candidate, 'url', ''), exc)
+    return False
+
+
+def _click_ziniao_passkey_button_via_windows_ui() -> bool:
+    """Click Ziniao's browser-level Passkey prompt when it is outside the DOM."""
+    if os.name != 'nt':
+        return False
+
+    script = r'''
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$buttonType = [System.Windows.Automation.ControlType]::Button
+$buttonName = '使用该Passkey登录'
+$nameCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::NameProperty,
+    $buttonName
+)
+$typeCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    $buttonType
+)
+$condition = New-Object System.Windows.Automation.AndCondition($nameCondition, $typeCondition)
+$target = [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    $condition
+)
+if ($null -eq $target) {
+    exit 2
+}
+$pattern = $null
+if (-not $target.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+    exit 3
+}
+([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+Write-Output 'clicked'
+'''
+    try:
+        completed = subprocess.run(
+            ['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and completed.stdout.strip() == 'clicked'
+
+
+def get_ziniao_agl_confirmation_diagnostics(page, context=None) -> str:
+    """Return concise state for troubleshooting Amazon's Ziniao handoff page."""
+    email_visible = _locator_is_visible(page.locator('#ap_email').first)
+    password_visible = _locator_is_visible(page.locator('#ap_password').first)
+    confirmation_pages = _get_ziniao_confirmation_pages(page, context=context)
+    confirmation_surfaces = _get_ziniao_confirmation_surfaces(page, context=context)
+    passkey_count = sum(
+        _locator_count(candidate.locator('button#dialog-btn-0').first)
+        for candidate in confirmation_surfaces
+    )
+    legal_continue_count = _locator_count(
+        page.locator('input#continue[aria-describedby="legalTextRow"]').first
+    )
+    continue_count = _locator_count(page.locator('input#continue').first)
+    return (
+        f'url={page.url}; email_visible={email_visible}; password_visible={password_visible}; '
+        f'passkey_count={passkey_count}; legal_continue_count={legal_continue_count}; '
+        f'continue_count={continue_count}; context_page_urls={[getattr(candidate, "url", "") for candidate in confirmation_pages]}'
+        f'; context_frame_urls={[getattr(candidate, "url", "") for candidate in confirmation_surfaces if candidate not in confirmation_pages]}'
+    )
+
+
+def continue_ziniao_agl_session(page, tracking_url: str, context=None) -> bool:
+    """Accept Ziniao's passwordless Amazon confirmation page when present."""
+    # The Ziniao browser may show this native Passkey confirmation before the
+    # standard Amazon handoff page. It is safe to prioritize because the ID is
+    # specific to the confirmation dialog.
+    passkey_selector = 'button#dialog-btn-0'
+    # The user-provided Amazon handoff button has a stable legalTextRow marker.
+    # It may coexist with an account field, so it must be checked before treating
+    # the page as a normal manual-login form.
+    legal_continue_selector = 'input#continue[aria-describedby="legalTextRow"]'
+    email_visible = _locator_is_visible(page.locator('#ap_email').first)
+    password_visible = _locator_is_visible(page.locator('#ap_password').first)
+    if email_visible or password_visible:
+        # A regular sign-in form can also expose input#continue. Only the exact
+        # passwordless-handoff or Ziniao Passkey control is safe to submit in
+        # that situation.
+        continue_selectors = (passkey_selector, legal_continue_selector)
+    else:
+        continue_selectors = (
+            passkey_selector,
+            legal_continue_selector,
+            'input#continue',
+            'button:has-text("Continue")',
+            'button:has-text("继续")',
+            'input[type="submit"][value*="Continue" i]',
+            'input[type="submit"][value*="继续"]',
+        )
+    clicked = _click_ziniao_passkey_button(page, context=context)
+    clicked_selector = passkey_selector if clicked else ''
+    if not clicked:
+        for selector in continue_selectors:
+            continue_button = page.locator(selector).first
+            if _locator_count(continue_button) == 0:
+                continue
+            try:
+                continue_button.wait_for(state='visible', timeout=8000)
+                try:
+                    continue_button.click(timeout=5000)
+                except TypeError:
+                    # Lightweight test doubles do not accept Playwright keyword args.
+                    continue_button.click()
+                except Exception:
+                    try:
+                        continue_button.click(timeout=5000, force=True)
+                    except TypeError:
+                        continue_button.click(force=True)
+                clicked = True
+                clicked_selector = selector
+                break
+            except Exception as exc:
+                logger.warning('紫鸟 AGL: 点击免密确认页继续按钮失败: selector=%s error=%s', selector, exc)
+
+    if not clicked:
+        diagnostics = get_ziniao_agl_confirmation_diagnostics(page, context=context)
+        if email_visible or password_visible:
+            logger.warning('紫鸟 AGL: 停留在需要人工处理的登录页，未点击普通继续按钮: %s', diagnostics)
+        elif _is_agl_signin_page(page):
+            logger.warning('紫鸟 AGL: 未找到可点击的免密确认继续按钮: %s', diagnostics)
+        return not _is_agl_signin_page(page)
+
+    logger.info('紫鸟 AGL: 已点击免密确认页继续按钮 selector=%s url=%s', clicked_selector, page.url)
+    # The hosted Passkey dialog is rendered only after Amazon's Continue
+    # request completes. Do not fail merely because the URL remains on
+    # /ap/signin during that short handoff.
+    passkey_clicked = clicked_selector == passkey_selector
+    for attempt in range(30):
+        if not _is_agl_login_pending(page):
+            break
+        if not passkey_clicked and _click_ziniao_passkey_button(page, context=context):
+            passkey_clicked = True
+            logger.info('紫鸟 AGL: 已点击 Continue 后出现的 Passkey 登录按钮')
+            continue
+        if not passkey_clicked and attempt % 2 == 0 and _click_ziniao_passkey_button_via_windows_ui():
+            passkey_clicked = True
+            logger.info('紫鸟 AGL: 已通过 Windows UI Automation 点击 Passkey 登录按钮')
+            continue
+        page.wait_for_timeout(500)
+
+    logger.info(
+        '紫鸟 AGL: 确认页处理完成 passkey_clicked=%s url=%s',
+        passkey_clicked,
+        page.url,
+    )
+    if not passkey_clicked and _is_agl_login_pending(page):
+        logger.warning(
+            '紫鸟 AGL: Continue 后未检测到 Passkey 登录按钮: %s',
+            get_ziniao_agl_confirmation_diagnostics(page, context=context),
+        )
+    if 'agl.amazon.com' not in page.url.lower():
+        try:
+            page.goto(tracking_url, wait_until='domcontentloaded', timeout=60000)
+            page.wait_for_timeout(1500)
+        except Exception as exc:
+            logger.warning('紫鸟 AGL: 继续后重新打开追踪页失败: %s', exc)
+    return 'agl.amazon.com' in page.url.lower() and not _is_agl_login_pending(page)
+
+
+def wait_for_agl_manual_verification(page, timeout_seconds: int) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    logger.warning('AGL 查询: 等待人工完成登录或验证码，最长等待 %s 秒', timeout_seconds)
+    while time.monotonic() < deadline:
+        if not _is_agl_login_pending(page):
+            logger.info('AGL 查询: 人工登录或验证码已完成')
+            return True
+        page.wait_for_timeout(1000)
+    return not _is_agl_login_pending(page)
+
+
+def save_agl_session_state(context, credential_source: str, page) -> None:
+    if _is_agl_signin_page(page) or _is_agl_mfa_page(page):
+        return
+    state_path = get_agl_session_state_path(credential_source)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    context.storage_state(path=str(state_path))
+    logger.info('AGL 查询: 已保存会话 账号来源=%s 路径=%s', credential_source, state_path)
+
+
+def _retry_agl_tracking_fetch(page, tracking_url: str, *, select_account: bool = True) -> list[dict[str, str]]:
     logger.info("AGL 查询: 首次未抓到轨迹，尝试页内刷新后重试")
     try:
         page.reload(wait_until='domcontentloaded', timeout=60000)
@@ -1210,9 +1650,9 @@ def _retry_agl_tracking_fetch(page, tracking_url: str) -> list[dict[str, str]]:
         page.goto(tracking_url, wait_until='domcontentloaded', timeout=60000)
 
     page.wait_for_timeout(1500)
-    maybe_select_agl_account(page)
-    page.wait_for_load_state('networkidle')
-    return wait_for_agl_tracking_stability(page)
+    if select_account:
+        maybe_select_agl_account(page)
+    return wait_for_agl_tracking_render(page)
 
 
 def query_agl(booking_id: str, order: dict[str, Any], headless: bool = False) -> dict[str, Any]:
@@ -1220,11 +1660,17 @@ def query_agl(booking_id: str, order: dict[str, Any], headless: bool = False) ->
     from playwright.sync_api import sync_playwright
 
     username, password, credential_source = get_agl_credentials(order)
+    use_ziniao = credential_source == 'AGL_EASYCAN_ZINIAO'
     logger.info("AGL 查询: booking_id=%s 账号来源=%s headless=%s", booking_id, credential_source, False)
-    cdp_process = begin_local_cdp_session()
+    cdp_process = None if use_ziniao else begin_local_cdp_session()
 
     with sync_playwright() as p:
-        browser, context, page, cleanup = create_agl_page(p, credential_source, False)
+        if use_ziniao:
+            browser_id = clean_text(os.environ.get('AGL_EASYCAN_ZINIAO_BROWSER_ID', ''))
+            ziniao_result = get_ziniao_webdriver_client().get_or_start_browser(browser_id)
+            browser, context, page, cleanup = create_ziniao_agl_page(p, ziniao_result['debuggingPort'])
+        else:
+            browser, context, page, cleanup = create_agl_page(p, credential_source, False)
 
         try:
             tracking_url = AGL_TRACKING_URL.format(booking_id=booking_id)
@@ -1232,10 +1678,23 @@ def query_agl(booking_id: str, order: dict[str, Any], headless: bool = False) ->
             page.goto(tracking_url, wait_until='domcontentloaded', timeout=60000)
             page.wait_for_timeout(1500)
 
-            logger.info("AGL 查询: 尝试选择账户")
-            maybe_select_agl_account(page)
+            if not use_ziniao:
+                logger.info("AGL 查询: 尝试选择账户")
+                maybe_select_agl_account(page)
+            elif not continue_ziniao_agl_session(page, tracking_url, context=context):
+                return {
+                    '平台': 'AGL',
+                    '查询值': booking_id,
+                    '账号来源': credential_source,
+                    '错误': '紫鸟环境中的 AGL 未登录或免密确认未通过',
+                    '阻塞原因': 'ZINIAO_AGL_LOGIN_REQUIRED',
+                    '当前URL': page.url,
+                    '当前页面标题': page.title(),
+                    '紫鸟确认页诊断': get_ziniao_agl_confirmation_diagnostics(page, context=context),
+                    '页面文本': clean_text(page.locator('body').inner_text())[:2000],
+                }
 
-            if page.locator('#ap_email').first.is_visible():
+            if not use_ziniao and page.locator('#ap_email').first.is_visible():
                 logger.info("AGL 查询: 填写账号")
                 page.locator('#ap_email').fill(username)
                 page.wait_for_timeout(600)
@@ -1245,7 +1704,7 @@ def query_agl(booking_id: str, order: dict[str, Any], headless: bool = False) ->
                 if invalid_account:
                     raise RuntimeError(f'AGL 账号格式无效: {username}')
 
-            if page.locator('#ap_password').first.count() > 0:
+            if not use_ziniao and page.locator('#ap_password').first.count() > 0:
                 logger.info("AGL 查询: 填写密码")
                 password_locator = page.locator('#ap_password').first
                 password_locator.wait_for(state='visible', timeout=15000)
@@ -1254,55 +1713,67 @@ def query_agl(booking_id: str, order: dict[str, Any], headless: bool = False) ->
                 page.locator('input#signInSubmit').click()
                 page.wait_for_timeout(2500)
 
-            if page.get_by_text('Your password is incorrect', exact=False).count() > 0:
+            if not use_ziniao and page.get_by_text('Your password is incorrect', exact=False).count() > 0:
                 raise RuntimeError('AGL 登录失败: 密码错误')
 
-            if 'ap/mfa' in page.url.lower() or page.get_by_text('Two-Step Verification', exact=False).count() > 0:
-                logger.warning("AGL 查询: 触发 MFA")
+            if not use_ziniao and _is_agl_login_pending(page) and not wait_for_agl_manual_verification(
+                page,
+                get_agl_manual_verification_wait_seconds(),
+            ):
+                logger.warning("AGL 查询: 人工登录或验证码等待超时")
                 return {
                     '平台': 'AGL',
                     '查询值': booking_id,
                     '账号来源': credential_source,
-                    '错误': 'AGL 登录需要二次验证',
-                    '阻塞原因': 'MFA_REQUIRED',
+                    '错误': 'AGL 登录或验证码等待超时',
+                    '阻塞原因': 'MANUAL_LOGIN_TIMEOUT',
                     '当前URL': page.url,
                     '当前页面标题': page.title(),
                     '页面文本': clean_text(page.locator('body').inner_text())[:2000],
                 }
 
-            maybe_select_agl_account(page)
-            page.wait_for_timeout(1500)
-
-            page.goto(tracking_url, wait_until='domcontentloaded', timeout=60000)
-            page.wait_for_timeout(1500)
-
-            maybe_select_agl_account(page)
-            page.wait_for_timeout(1500)
-            logger.info("AGL 查询: 切换语言")
-            language = set_agl_language_to_zh(page)
-            page.wait_for_timeout(2000)
-
-            if 'global-picker' in page.url.lower():
+            language = ''
+            if not use_ziniao:
                 maybe_select_agl_account(page)
-                page.wait_for_timeout(2500)
+                page.wait_for_timeout(1500)
+                page.goto(tracking_url, wait_until='domcontentloaded', timeout=60000)
+                page.wait_for_timeout(1500)
+                maybe_select_agl_account(page)
+                page.wait_for_timeout(1500)
+                logger.info("AGL 查询: 切换语言")
+                language = set_agl_language_to_zh(page)
+                page.wait_for_timeout(2000)
+                if 'global-picker' in page.url.lower():
+                    maybe_select_agl_account(page)
+                    page.wait_for_timeout(2500)
 
             if _is_agl_signin_page(page):
                 return {
                     '平台': 'AGL',
                     '查询值': booking_id,
                     '账号来源': credential_source,
-                    '错误': 'AGL 登录后仍停留在登录页',
-                    '阻塞原因': 'LOGIN_NOT_COMPLETED',
+                    '错误': '紫鸟环境中的 AGL 未登录或登录已失效' if use_ziniao else 'AGL 登录后仍停留在登录页',
+                    '阻塞原因': 'ZINIAO_AGL_LOGIN_REQUIRED' if use_ziniao else 'LOGIN_NOT_COMPLETED',
                     '当前URL': page.url,
                     '当前页面标题': page.title(),
                     '页面文本': clean_text(page.locator('body').inner_text())[:2000],
                 }
 
-            page.wait_for_load_state('networkidle')
-            tracks = wait_for_agl_tracking_stability(page)
+            tracks = wait_for_agl_tracking_render(page)
             if not tracks and not _is_agl_signin_page(page):
-                tracks = _retry_agl_tracking_fetch(page, tracking_url)
+                tracks = _retry_agl_tracking_fetch(page, tracking_url, select_account=not use_ziniao)
             logger.info("AGL 查询: 轨迹条数=%s", len(tracks))
+            if not tracks:
+                return {
+                    '平台': 'AGL',
+                    '查询值': booking_id,
+                    '账号来源': credential_source,
+                    '语言': language,
+                    '错误': 'AGL 页面未加载轨迹组件或未返回轨迹信息',
+                    '阻塞原因': 'TRACKING_NOT_RENDERED',
+                    '当前URL': page.url,
+                    '当前页面标题': page.title(),
+                }
             latest_track = tracks[0] if tracks else {}
             return {
                 '平台': 'AGL',
@@ -1315,10 +1786,10 @@ def query_agl(booking_id: str, order: dict[str, Any], headless: bool = False) ->
                 '物流轨迹': tracks,
             }
         except PlaywrightTimeoutError as exc:
-            tracks = wait_for_agl_tracking_stability(page, wait_ms=800, max_checks=2)
+            tracks = wait_for_agl_tracking_render(page)
             if not tracks and not _is_agl_signin_page(page):
                 try:
-                    tracks = _retry_agl_tracking_fetch(page, tracking_url)
+                    tracks = _retry_agl_tracking_fetch(page, tracking_url, select_account=not use_ziniao)
                 except Exception as retry_exc:
                     logger.warning("AGL 查询: 超时后页内重试失败: %s", retry_exc)
             if tracks and not _is_agl_signin_page(page):
@@ -1326,7 +1797,7 @@ def query_agl(booking_id: str, order: dict[str, Any], headless: bool = False) ->
                     '平台': 'AGL',
                     '查询值': booking_id,
                     '账号来源': credential_source,
-                    '语言': set_agl_language_to_zh(page),
+                    '语言': '' if use_ziniao else set_agl_language_to_zh(page),
                     '当前URL': page.url,
                     '当前页面标题': page.title(),
                     '最新轨迹': tracks[0],
@@ -1338,6 +1809,7 @@ def query_agl(booking_id: str, order: dict[str, Any], headless: bool = False) ->
                 '查询值': booking_id,
                 '账号来源': credential_source,
                 '错误': f'AGL 页面等待超时: {exc}',
+                '阻塞原因': 'TRACKING_NOT_RENDERED',
                 '当前URL': page.url,
                 '当前页面标题': page.title(),
                 '页面文本': clean_text(page.locator('body').inner_text())[:2000],
@@ -1353,13 +1825,14 @@ def query_agl(booking_id: str, order: dict[str, Any], headless: bool = False) ->
                 '页面文本': clean_text(page.locator('body').inner_text())[:2000],
             }
         finally:
-            try:
-                logger.info("AGL 查询: 尝试退出登录")
-                logout_agl(page)
-            except Exception as logout_exc:
-                logger.warning("AGL 查询: 退出登录失败: %s", logout_exc)
+            if not use_ziniao:
+                try:
+                    save_agl_session_state(context, credential_source, page)
+                except Exception as session_exc:
+                    logger.warning("AGL 查询: 保存会话失败: %s", session_exc)
             cleanup()
-            end_local_cdp_session(cdp_process)
+            if not use_ziniao:
+                end_local_cdp_session(cdp_process)
 
 
 def extract_baosen_track_items_from_html(html: str) -> list[dict[str, str]]:
@@ -1367,21 +1840,55 @@ def extract_baosen_track_items_from_html(html: str) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
 
     for part in parts:
-        if 'operation-time' not in part or 'class="operation"' not in part:
-            continue
-
         time_match = re.search(r'<div[^>]*class="operation-time[^"]*"[^>]*>.*?<span[^>]*>(.*?)</span>', part, re.S)
         content_match = re.search(r'<div[^>]*class="operation"[^>]*>.*?<span[^>]*>(.*?)</span>', part, re.S)
-        if not time_match or not content_match:
+        if not content_match:
             continue
 
-        time_text = clean_text(unescape(re.sub(r'<[^>]+>', '', time_match.group(1))))
         content_text = clean_text(unescape(re.sub(r'<[^>]+>', '', content_match.group(1))))
-        if not time_text or not content_text:
+        if not content_text:
             continue
+
+        time_text = ''
+        if time_match:
+            time_text = clean_text(unescape(re.sub(r'<[^>]+>', '', time_match.group(1))))
+
+        # The current Baosen timeline leaves its timestamp column empty and
+        # embeds the event time in the operation text instead.
+        if not time_text:
+            embedded_time = re.search(
+                r'\b20\d{2}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?(?!:\d)',
+                content_text,
+            )
+            if embedded_time:
+                time_text = embedded_time.group(0)
 
         items.append({'时间': time_text, '内容': content_text})
 
+    return items
+
+
+def extract_yinghe_track_items_from_html(html: str) -> list[dict[str, str]]:
+    """Extract timeline entries from an expanded Yinghe child shipment panel."""
+    items: list[dict[str, str]] = []
+    parts = re.split(r'<li[^>]*class="[^"]*el-timeline-item[^"]*"[^>]*>', html, flags=re.I)
+    for part in parts:
+        time_match = re.search(
+            r'<div[^>]*class="[^"]*el-timeline-item__timestamp[^"]*"[^>]*>(.*?)</div>',
+            part,
+            re.S | re.I,
+        )
+        content_match = re.search(
+            r'<div[^>]*class="[^"]*el-timeline-item__content[^"]*"[^>]*>(.*?)</div>',
+            part,
+            re.S | re.I,
+        )
+        if not time_match or not content_match:
+            continue
+        time_text = clean_text(unescape(re.sub(r'<[^>]+>', '', time_match.group(1))))
+        content_text = clean_text(unescape(re.sub(r'<[^>]+>', '', content_match.group(1))))
+        if time_text and content_text:
+            items.append({'时间': time_text, '内容': content_text})
     return items
 
 
@@ -1402,6 +1909,40 @@ def extract_17track_items_from_html(html: str) -> list[dict[str, str]]:
 
 def extract_uniuni_tracking_items_from_html(html: str) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
+    history_match = re.search(r'>\s*Tracking\s+History\s*</[^>]+>(?P<body>.*)', html, re.S | re.I)
+    if history_match:
+        history_html = re.sub(r'<(?:script|style)\b[^>]*>.*?</(?:script|style)>', '', history_match.group('body'), flags=re.S | re.I)
+        visible_texts = [
+            clean_text(unescape(value))
+            for value in re.findall(r'>([^<>]+)<', history_html)
+        ]
+        visible_texts = [value for value in visible_texts if value]
+
+        index = 0
+        while index + 2 < len(visible_texts):
+            date_text = visible_texts[index]
+            time_text = visible_texts[index + 1]
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date_text) or not re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2})?', time_text):
+                index += 1
+                continue
+
+            status_text = visible_texts[index + 2]
+            location_text = ''
+            next_index = index + 3
+            if next_index < len(visible_texts) and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', visible_texts[next_index]):
+                location_text = visible_texts[next_index]
+                next_index += 1
+
+            items.append({
+                '时间': clean_text(f'{date_text} {time_text}'),
+                '内容': status_text,
+                '地点': location_text,
+            })
+            index = next_index
+
+        if items:
+            return items
+
     blocks = html.split('class="tracking-large"')
 
     for raw_block in blocks[1:]:
@@ -1532,8 +2073,14 @@ async def _resolve_async_result(result):
     return await tracking_runtime_service.resolve_async_result(result)
 
 
-async def run_browser_tracking_query_with_queue(platform: str, query_value: str, operation):
-    return await tracking_runtime_service.run_browser_tracking_query_with_queue(logger, platform, query_value, operation)
+async def run_browser_tracking_query_with_queue(platform: str, query_value: str, operation, *, dedup_key: str | None = None):
+    return await tracking_runtime_service.run_browser_tracking_query_with_queue(
+        logger,
+        platform,
+        query_value,
+        operation,
+        dedup_key=dedup_key,
+    )
 
 
 async def apply_browser_stealth(context, page, platform: str = '') -> None:
@@ -1565,6 +2112,73 @@ def extract_ups_current_status_from_html(html: str) -> str:
         if aria_match:
             text = clean_text(unescape(re.sub(r'<[^>]+>', '', aria_match.group(1))))
             if text:
+                return text
+    return ''
+
+
+def extract_ups_latest_time_from_html(html: str) -> str:
+    last_location_match = re.search(
+        r'id="stApp_lastLocationDateTime"[^>]*>\s*(.*?)\s*</',
+        html,
+        re.S | re.I,
+    )
+    if last_location_match:
+        last_location_text = clean_text(unescape(re.sub(r'<[^>]+>', '', last_location_match.group(1))))
+        datetime_match = re.search(
+            r'(\d{2}/\d{2}/\d{4},\s*\d{1,2}:\d{2}\s*[AP]\.M\.)',
+            last_location_text,
+            re.I,
+        )
+        if datetime_match:
+            return clean_text(datetime_match.group(1))
+
+    if 'stApp_packageStatusTimeLbl_time' in html or 'estimatedDeliverySection' in html:
+        text_blocks = [
+            clean_text(unescape(re.sub(r'<[^>]+>', '', block)))
+            for block in re.findall(
+                r'<span[^>]*class="[^"]*ups-txt_size_double[^"]*"[^>]*>(.*?)</span>',
+                html,
+                re.S | re.I,
+            )
+        ]
+        text_blocks = [block for block in text_blocks if block]
+        date_text = text_blocks[0] if text_blocks else ''
+        time_match = re.search(
+            r'id="stApp_packageStatusTimeLbl_time"[^>]*>\s*(.*?)\s*</span>',
+            html,
+            re.S | re.I,
+        )
+        time_text = clean_text(unescape(re.sub(r'<[^>]+>', '', time_match.group(1)))) if time_match else ''
+        estimated_text = clean_text(f'{date_text} {time_text}')
+        if estimated_text:
+            return estimated_text
+
+    label_patterns = [
+        'Delivered On',
+        'Delivered',
+        'Scheduled Delivery',
+        'Delivery Date',
+        'Estimated Delivery',
+    ]
+    for label in label_patterns:
+        pattern = re.compile(
+            rf'>{re.escape(label)}<.*?>\s*([^<>]+?)\s*<',
+            re.S | re.I,
+        )
+        match = pattern.search(html)
+        if match:
+            text = clean_text(unescape(re.sub(r'<[^>]+>', '', match.group(1))))
+            if text and text.lower() != label.lower():
+                return text
+
+        pair_pattern = re.compile(
+            rf'(?:{re.escape(label)})\s*</[^>]+>\s*<[^>]+>\s*([^<>]+?)\s*<',
+            re.S | re.I,
+        )
+        match = pair_pattern.search(html)
+        if match:
+            text = clean_text(unescape(re.sub(r'<[^>]+>', '', match.group(1))))
+            if text and text.lower() != label.lower():
                 return text
     return ''
 
@@ -1672,12 +2286,12 @@ def extract_amazon_uk_tracking_items_from_html(html: str) -> list[dict[str, str]
             re.S,
         )
         detail_blocks = re.findall(r'<div[^>]*class="[^"]*css-1xz1o3r[^"]*"[^>]*>\s*(.*?)\s*</div>', row_block, re.S)
-        if not time_match or len(detail_blocks) < 2:
+        if not time_match or not detail_blocks:
             continue
 
         time_text = clean_text(unescape(re.sub(r'<[^>]+>', '', time_match.group(1))))
         status_text = clean_text(unescape(re.sub(r'<[^>]+>', '', detail_blocks[0])))
-        location_text = clean_text(unescape(re.sub(r'<[^>]+>', '', detail_blocks[1])))
+        location_text = clean_text(unescape(re.sub(r'<[^>]+>', '', detail_blocks[1]))) if len(detail_blocks) > 1 else ''
         if not time_text or not status_text:
             continue
 
@@ -1727,26 +2341,22 @@ def extract_amazon_uk_summary_from_html(html: str) -> dict[str, str]:
 
 def build_amazon_us_debug_dir(day: str | None = None) -> Path:
     normalized_day = clean_text(day or datetime.now(UTC).date().isoformat()) or datetime.now(UTC).date().isoformat()
-    root_dir = Path(__file__).resolve().parent / 'tmp'
-    return root_dir / 'amazon-us-debug' / normalized_day
+    return _build_platform_debug_dir('amazon-us', normalized_day)
 
 
 def build_amazon_uk_debug_dir(day: str | None = None) -> Path:
     normalized_day = clean_text(day or datetime.now(UTC).date().isoformat()) or datetime.now(UTC).date().isoformat()
-    root_dir = Path(__file__).resolve().parent / 'tmp'
-    return root_dir / 'amazon-uk-debug' / normalized_day
+    return _build_platform_debug_dir('amazon-uk', normalized_day)
 
 
 def build_gofo_debug_dir(day: str | None = None) -> Path:
     normalized_day = clean_text(day or datetime.now().strftime('%Y-%m-%d')) or datetime.now().strftime('%Y-%m-%d')
-    root_dir = Path(__file__).resolve().parent / 'tmp'
-    return root_dir / 'gofo-debug' / normalized_day
+    return _build_platform_debug_dir('gofo', normalized_day)
 
 
 def build_usps_debug_dir(day: str | None = None) -> Path:
     normalized_day = clean_text(day or datetime.now().strftime('%Y-%m-%d')) or datetime.now().strftime('%Y-%m-%d')
-    root_dir = Path(__file__).resolve().parent / 'tmp'
-    return root_dir / 'usps-debug' / normalized_day
+    return _build_platform_debug_dir('usps', normalized_day)
 
 
 async def query_17track(order_no: str) -> dict[str, Any]:
@@ -2047,6 +2657,89 @@ async def query_baosen(order_no: str) -> dict[str, Any]:
             end_local_cdp_session(cdp_process)
 
 
+async def query_yinghe(order_no: str) -> dict[str, Any]:
+    """Query Yinghe logistics status from its web tracking page."""
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.async_api import async_playwright
+
+    normalized = normalize_tracking_number(order_no)
+    logger.info("盈和查询: order_no=%s", normalized)
+    cdp_process = begin_local_cdp_session()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
+        context, page, owns_context = await open_cdp_query_page(
+            browser,
+            viewport={'width': 1440, 'height': 900},
+        )
+        try:
+            await apply_browser_stealth(context, page, platform='YINGHE')
+            await page.goto(YINGHE_URL, wait_until='domcontentloaded', timeout=60000)
+            textarea = page.locator('textarea.el-textarea__inner').first
+            await textarea.wait_for(state='visible', timeout=15000)
+            await textarea.fill(normalized)
+
+            query_button = page.get_by_text('查询', exact=True).first
+            await query_button.wait_for(state='visible', timeout=10000)
+            await query_button.click(timeout=10000)
+
+            result_tag = page.locator('.el-tag__content').filter(has_text=normalized).first
+            try:
+                await result_tag.wait_for(state='visible', timeout=30000)
+            except PlaywrightTimeoutError:
+                return {
+                    '平台': '盈和',
+                    '查询值': normalized,
+                    '物流轨迹': [],
+                    '最新轨迹': {},
+                    '错误': '盈和页面未找到对应物流编号结果',
+                    '当前URL': page.url,
+                }
+
+            # Expand the shipment and its first child before reading the timeline.
+            await result_tag.click(timeout=10000)
+            child_header = page.locator('.el-collapse-item__header').filter(has_text=re.compile(r'子单\s*1')).first
+            if await child_header.count() == 0:
+                child_header = page.locator('.el-collapse-item__header').filter(has_text=re.compile(r'子单')).first
+            await child_header.wait_for(state='visible', timeout=15000)
+            await child_header.click(timeout=10000)
+
+            child_item = child_header.locator('xpath=ancestor::div[contains(@class,"el-collapse-item")][1]')
+            timeline = child_item.locator('ul.el-timeline').first
+            await timeline.wait_for(state='visible', timeout=20000)
+            html = await timeline.inner_html(timeout=10000)
+            tracks = sort_tracks_newest_first(extract_yinghe_track_items_from_html(html))
+            if not tracks:
+                return {
+                    '平台': '盈和',
+                    '查询值': normalized,
+                    '物流轨迹': [],
+                    '最新轨迹': {},
+                    '错误': '盈和页面未返回物流轨迹信息',
+                    '当前URL': page.url,
+                }
+            return {
+                '平台': '盈和',
+                '查询值': normalized,
+                '物流轨迹': tracks,
+                '最新轨迹': tracks[0],
+                '当前URL': page.url,
+                '物流链接': YINGHE_URL,
+            }
+        except Exception as exc:
+            return {
+                '平台': '盈和',
+                '查询值': normalized,
+                '物流轨迹': [],
+                '最新轨迹': {},
+                '错误': str(exc) or '盈和查询异常',
+                '当前URL': page.url,
+            }
+        finally:
+            await cleanup_cdp_query_page(page, context, owns_context)
+            end_local_cdp_session(cdp_process)
+
+
 def get_meitong_access_token() -> str:
     logger.info("美通: 获取 token")
     response = requests.post(
@@ -2155,6 +2848,121 @@ def query_meitong(fba_code: str) -> dict[str, Any]:
 PINGYI_ROOT_URL = 'http://hzpy.rtb56.com/'
 PINGYI_URL = 'http://hzpy.rtb56.com/login.aspx'
 PINGYI_USERCENTER_URL = 'http://hzpy.rtb56.com/usercenter/index.aspx'
+PINGYI_API_SERVICE_PATH = '/webservice/PublicService.asmx/ServiceInterfaceUTF8'
+
+
+def get_pingyi_api_url() -> str:
+    base_url = os.environ.get('PINGYI_BASE_URL', 'http://hzpy.rtb56.com').strip().rstrip('/')
+    if not base_url:
+        raise ValueError('PINGYI_BASE_URL 不能为空')
+    return f'{base_url}{PINGYI_API_SERVICE_PATH}'
+
+
+def get_pingyi_api_timeout_seconds() -> int:
+    raw_value = os.environ.get('PINGYI_API_TIMEOUT_SECONDS', '20').strip()
+    try:
+        return max(5, min(60, int(raw_value)))
+    except ValueError:
+        return 20
+
+
+def _pingyi_api_success(payload: dict[str, Any]) -> bool:
+    value = payload.get('success')
+    return value is True or str(value).strip().lower() in {'true', '1', 'ok', 'success'}
+
+
+def _pingyi_api_message(payload: dict[str, Any]) -> str:
+    for key in ('message', 'msg', 'error', 'errorMessage'):
+        message = clean_text(payload.get(key, ''))
+        if message:
+            return message
+    return '未知错误'
+
+
+def _pingyi_api_data_to_first_record(payload: dict[str, Any]) -> dict[str, Any] | None:
+    data = payload.get('data')
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(data, list):
+        return next((item for item in data if isinstance(item, dict)), None)
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def call_pingyi_service(service_method: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    """调用软通宝 PublicService；单号不存在时返回 None。"""
+    response = requests.post(
+        get_pingyi_api_url(),
+        data={
+            'appToken': get_env('PINGYI_APP_TOKEN'),
+            'appKey': get_env('PINGYI_APP_KEY'),
+            'serviceMethod': service_method,
+            'paramsJson': json.dumps(params, ensure_ascii=False, separators=(',', ':')),
+        },
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        timeout=get_pingyi_api_timeout_seconds(),
+    )
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError('平谊 API 返回了非 JSON 响应') from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError('平谊 API 返回格式异常')
+    if _pingyi_api_success(payload):
+        return _pingyi_api_data_to_first_record(payload)
+
+    message = _pingyi_api_message(payload)
+    if '不存在' in message:
+        return None
+    raise RuntimeError(f'平谊 API 查询失败: {message}')
+
+
+def query_pingyi_api(tracking_number: str) -> dict[str, Any] | None:
+    normalized = clean_text(tracking_number)
+    if not normalized:
+        raise ValueError('平谊查询值不能为空')
+    logger.info('平谊 API 查询: tracking_number=%s', normalized)
+    return call_pingyi_service('getTrack', {'tracking_number': normalized})
+
+
+def normalize_pingyi_track_items(record: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not isinstance(record, dict):
+        return []
+    details = record.get('details') or []
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except json.JSONDecodeError:
+            details = []
+    if isinstance(details, dict):
+        details = [details]
+    if not isinstance(details, list):
+        return []
+
+    tracks: list[dict[str, str]] = []
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        time_text = clean_text(detail.get('track_occur_date', ''))
+        content_text = clean_text(detail.get('track_description', ''))
+        if not content_text:
+            content_text = clean_text(detail.get('track_status', ''))
+        if not time_text and not content_text:
+            continue
+        track = {'时间': time_text, '内容': content_text}
+        location_text = clean_text(detail.get('track_location', ''))
+        status_code = clean_text(detail.get('track_code', ''))
+        if location_text:
+            track['地点'] = location_text
+        if status_code:
+            track['状态代码'] = status_code
+        tracks.append(track)
+    return sort_tracks_newest_first(tracks)
 
 
 def _recognize_verify_code(img_bytes: bytes) -> str:
@@ -2167,7 +2975,10 @@ def _recognize_verify_code(img_bytes: bytes) -> str:
 async def _type_like_human(page, selector: str, value: str, delay_range: tuple[int, int] = (80, 160)) -> None:
     locator = page.locator(selector)
     await locator.wait_for(state='visible', timeout=15000)
-    await locator.click()
+    try:
+        await locator.click()
+    except Exception:
+        await locator.click(force=True)
     await page.wait_for_timeout(random.randint(120, 280))
     try:
         await locator.press('Control+a')
@@ -2236,24 +3047,109 @@ async def _get_pingyi_mainframe(page, timeout_ms: int = 20000):
     raise RuntimeError('平谊 mainframe 未进入运单查询页')
 
 
+_PINGYI_TRACK_DIALOG_PATTERN = re.compile(
+    r"showtrackdialog\(\s*['\"]?([0-9A-Za-z_-]+)['\"]?\s*,\s*(['\"])(.*?)\2\s*\)",
+    re.I | re.S,
+)
+_PINGYI_ORDER_DIALOG_PATTERN = re.compile(
+    r"\bshowdialog\(\s*['\"]?([0-9A-Za-z_-]+)['\"]?\s*,\s*(['\"])(.*?)\2\s*\)",
+    re.I | re.S,
+)
+
+
+def _html_to_text(html: str) -> str:
+    return clean_text(unescape(re.sub(r'<[^>]+>', ' ', html or '')))
+
+
+def _extract_pingyi_track_bs_id(html: str, fba_code: str) -> str:
+    normalized_fba = clean_text(fba_code).upper()
+    if not html or not normalized_fba:
+        return ''
+
+    matches = list(_PINGYI_TRACK_DIALOG_PATTERN.finditer(html))
+    order_bs_ids = [
+        match.group(1)
+        for match in _PINGYI_ORDER_DIALOG_PATTERN.finditer(html)
+        if normalized_fba in clean_text(match.group(3)).upper()
+    ]
+    if order_bs_ids:
+        order_bs_id_set = set(order_bs_ids)
+        for match in matches:
+            if match.group(1) in order_bs_id_set:
+                return match.group(1)
+
+    for match in matches:
+        if normalized_fba in clean_text(match.group(3)).upper():
+            return match.group(1)
+
+    row_pattern = re.compile(r'<tr\b[^>]*>.*?</tr>', re.I | re.S)
+    for row_match in row_pattern.finditer(html):
+        row_html = row_match.group(0)
+        if normalized_fba not in _html_to_text(row_html).upper():
+            continue
+        dialog_match = _PINGYI_TRACK_DIALOG_PATTERN.search(row_html)
+        if dialog_match:
+            return dialog_match.group(1)
+
+    if len(matches) == 1 and normalized_fba in _html_to_text(html).upper():
+        return matches[0].group(1)
+    return ''
+
+
 async def _wait_for_pingyi_search_result(frame, fba_code: str, timeout_ms: int = 12000) -> str:
     deadline = time.time() + timeout_ms / 1000
-    pattern = rf"showtrackdialog\('(\d+)','([^']*{re.escape(fba_code)}[^']*)'\)"
     last_html = ''
 
     while time.time() < deadline:
         html = await frame.locator('body').inner_html()
         last_html = html
-        if re.search(pattern, html, re.IGNORECASE):
+        if _extract_pingyi_track_bs_id(html, fba_code):
             return html
 
-        body_text = clean_text(re.sub(r'<[^>]+>', ' ', html))
+        body_text = _html_to_text(html)
         if any(keyword in body_text for keyword in ('没有记录', '暂无数据', '未查询到', '没有查询到')):
             return html
 
         await frame.wait_for_timeout(800)
 
     return last_html
+
+
+async def _dump_pingyi_search_debug_artifacts(page, frame, fba_code: str) -> tuple[str, str, str]:
+    normalized = normalize_tracking_number(fba_code) or clean_text(fba_code) or 'unknown'
+    debug_dir = _build_platform_debug_dir('pingyi', datetime.now().strftime('%Y-%m-%d')) / normalized
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    html_path = debug_dir / 'search-result.html'
+    screenshot_path = debug_dir / 'screenshot.png'
+
+    try:
+        html = await frame.locator('body').inner_html()
+    except Exception:
+        html = ''
+    html_path.write_text(html, encoding='utf-8')
+
+    try:
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+    except Exception:
+        pass
+
+    try:
+        title = await page.title()
+    except Exception:
+        title = ''
+    try:
+        url = page.url
+    except Exception:
+        url = ''
+    logger.warning(
+        "平谊查询调试文件已保存 fba_code=%s title=%s url=%s html=%s screenshot=%s",
+        fba_code,
+        title,
+        url,
+        html_path,
+        screenshot_path,
+    )
+    return title, url, str(html_path)
 
 
 async def _goto_pingyi_page(page, url: str, timeout: int = 30000) -> None:
@@ -2420,98 +3316,46 @@ async def login_pingyi(playwright, max_retries: int = 3) -> tuple:
 
         raise RuntimeError(f'平谊系统登录失败，已尝试 {max_retries} 次')
     except Exception:
+        try:
+            await page.close()
+        except Exception:
+            pass
         await browser.close()
         end_local_cdp_session(cdp_process)
         raise
 
 
 async def query_pingyi(fba_code: str) -> dict[str, Any]:
-    """查询平谊系统订单物流轨迹"""
-    from playwright.async_api import async_playwright
-
-    browser = None
-    async with async_playwright() as p:
-        try:
-            logger.info("平谊查询: 开始 fba_code=%s", fba_code)
-            browser, page = await login_pingyi(p)
-        except Exception as e:
-            return {'平台': '平谊', '查询值': fba_code, '最新轨迹': {}, '物流轨迹': [], '错误': str(e)}
-
-        try:
-            await _open_pingyi_order_query_page(page)
-            if page.is_closed():
-                raise RuntimeError('平谊查询页面已被意外关闭')
-
-            frame = await _get_pingyi_mainframe(page, timeout_ms=20000)
-
-            logger.info("平谊查询: 输入运单号")
-            txt_no = frame.locator('#txtNo')
-            await txt_no.wait_for(state='visible', timeout=10000)
-            await txt_no.click()
-            await txt_no.press('Control+a')
-            await txt_no.press('Backspace')
-            await txt_no.fill(fba_code)
-            await page.wait_for_timeout(300)
-
-            logger.info("平谊查询: 触发搜索")
-            search_button = frame.locator('#btnSearch').first
-            await search_button.wait_for(state='visible', timeout=15000)
-            try:
-                await search_button.click(timeout=5000)
-            except Exception:
-                await frame.evaluate(
-                    """
-                    () => {
-                        const node = document.querySelector('#btnSearch');
-                        if (!node) {
-                            throw new Error('mainframe #btnSearch not found');
-                        }
-                        node.click();
-                    }
-                    """
-                )
-            await page.wait_for_timeout(2000)
-
-            logger.info("平谊查询: 解析搜索结果")
-            html = await _wait_for_pingyi_search_result(frame, fba_code, timeout_ms=12000)
-            pattern = rf"showtrackdialog\('(\d+)','([^']*{re.escape(fba_code)}[^']*)'\)"
-            match = re.search(pattern, html, re.IGNORECASE)
-            if not match:
-                return {'平台': '平谊', '查询值': fba_code, '最新轨迹': {}, '物流轨迹': [], '错误': f'未找到 FBA {fba_code} 的记录'}
-
-            bs_id = match.group(1)
-
-            logger.info("平谊查询: 打开轨迹详情页")
-            track_url = f'http://hzpy.rtb56.com/usercenter/dialog/dialog_trackdetails.aspx?bs_id={bs_id}'
-            await page.goto(track_url)
-            await page.wait_for_timeout(5000)
-
-            logger.info("平谊查询: 提取轨迹表格")
-            tracks = []
-            rows = page.locator('table tbody tr')
-            for ri in range(await rows.count()):
-                cells = rows.nth(ri).locator('td')
-                if await cells.count() >= 3:
-                    time_text = (await cells.nth(0).inner_text()).strip()
-                    location = (await cells.nth(1).inner_text()).strip()
-                    content = (await cells.nth(2).inner_text()).strip()
-                    if time_text and time_text != '发生时间':
-                        tracks.append({'时间': time_text, '地点': location, '内容': content})
-
-            logger.info("平谊查询: 轨迹条数=%s", len(tracks))
+    """通过软通宝 PublicService 查询平谊轨迹。"""
+    query_value = clean_text(fba_code)
+    try:
+        record = await asyncio.to_thread(query_pingyi_api, query_value)
+        if record is None:
             return {
                 '平台': '平谊',
-                '查询值': fba_code,
-                '物流轨迹': tracks,
-                '最新轨迹': tracks[0] if tracks else {},
+                '查询值': query_value,
+                '最新轨迹': {},
+                '物流轨迹': [],
+                '错误': f'未找到 FBA {query_value} 的记录',
             }
-
-        except Exception as e:
-            return {'平台': '平谊', '查询值': fba_code, '最新轨迹': {}, '物流轨迹': [], '错误': str(e)}
-        finally:
-            if browser:
-                await browser.close()
-            end_local_cdp_session(None)
+        tracks = normalize_pingyi_track_items(record)
+        logger.info('平谊 API 查询: 查询值=%s 轨迹条数=%s', query_value, len(tracks))
+        return {
+            '平台': '平谊',
+            '查询值': query_value,
+            '物流编号': clean_text(record.get('tracking_number', '') or record.get('hawb_code', '')),
+            '最新轨迹': tracks[0] if tracks else {},
+            '物流轨迹': tracks,
+        }
+    except Exception as exc:
+        logger.warning('平谊 API 查询失败: 查询值=%s 错误=%s', query_value, exc)
+        return {
+            '平台': '平谊',
+            '查询值': query_value,
+            '最新轨迹': {},
+            '物流轨迹': [],
+            '错误': str(exc),
+        }
 
 
 def decide_platform(order: dict[str, Any] | None, explicit_platform: str) -> str:
@@ -2531,6 +3375,8 @@ def decide_platform(order: dict[str, Any] | None, explicit_platform: str) -> str
         return 'qq'
     if carrier == '大黄蜂':
         return '17track'
+    if carrier == '盈和':
+        return 'yinghe'
     return 'meitong'
 
 
@@ -2546,7 +3392,7 @@ def decide_tracking_platform(tracking_no: str) -> str:
         return 'usps'
     if normalized.startswith('1Z0'):
         return 'ups'
-    if normalized.startswith('H00RVA') or normalized.startswith('GV'):
+    if normalized.startswith('YT'):
         return 'yuntrack'
     if normalized.startswith('UK'):
         return 'amazon_uk'
@@ -2571,7 +3417,7 @@ async def query_tracking_number(tracking_no: str) -> dict[str, Any]:
     elif platform == 'gofo':
         result = await query_gofo_tracking(normalized)
     elif platform == 'fedex':
-        result = await query_fedex_tracking(normalized)
+        result = await query_17track(normalized)
     elif platform == 'usps':
         result = await query_usps_tracking(normalized)
     elif platform == 'ups':
@@ -2611,9 +3457,10 @@ async def query_fedex_tracking(tracking_no: str) -> dict[str, Any]:
 
 
 def build_gofo_download_dir(base_dir: Path | None = None, day_text: str | None = None) -> Path:
-    root_dir = base_dir or Path('tmp')
     normalized_day = normalize_optional_text(day_text) or datetime.now().strftime('%Y-%m-%d')
-    return root_dir / 'tracking-downloads' / normalized_day / 'gofo'
+    if base_dir is not None:
+        return base_dir / 'tracking-downloads' / normalized_day / 'gofo'
+    return _build_platform_download_dir('gofo', normalized_day)
 
 
 def build_gofo_download_path(
@@ -2656,6 +3503,23 @@ def _xlsx_cell_text(cell: ElementTree.Element, namespace: dict[str, str], shared
     return raw_value
 
 
+def extract_event_time_prefix(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ''
+    patterns = [
+        r'^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})',
+        r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})',
+        r'^(\d{4}/\d{2}/\d{2} \d{2}:\d{2})',
+        r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})',
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text)
+        if match:
+            return match.group(1)
+    return ''
+
+
 def parse_gofo_export_summary_xlsx(path: Path) -> dict[str, str]:
     namespace = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
     try:
@@ -2694,10 +3558,19 @@ def parse_gofo_export_summary_xlsx(path: Path) -> dict[str, str]:
     return row
 
 
+def build_gofo_latest_track(row: dict[str, str]) -> dict[str, str]:
+    return {
+        '时间': extract_event_time_prefix(row.get('Last Event', '')),
+        '内容': clean_text(row.get('Current status', '')),
+        '地点': '',
+    }
+
+
 def build_yuntrack_download_dir(base_dir: Path | None = None, day_text: str | None = None) -> Path:
-    root_dir = base_dir or Path('tmp')
     normalized_day = normalize_optional_text(day_text) or datetime.now().strftime('%Y-%m-%d')
-    return root_dir / 'tracking-downloads' / normalized_day / 'yuntrack'
+    if base_dir is not None:
+        return base_dir / 'tracking-downloads' / normalized_day / 'yuntrack'
+    return _build_platform_download_dir('yuntrack', normalized_day)
 
 
 def build_yuntrack_download_path(
@@ -2747,6 +3620,14 @@ def parse_yuntrack_export_summary_xlsx(path: Path) -> dict[str, str]:
     return row
 
 
+def build_yuntrack_latest_track(row: dict[str, str]) -> dict[str, str]:
+    return {
+        '时间': extract_event_time_prefix(row.get('Last Event', '')),
+        '内容': clean_text(row.get('Delivery Status', '')),
+        '地点': '',
+    }
+
+
 async def query_uniuni_tracking(tracking_no: str) -> dict[str, Any]:
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     from playwright.async_api import async_playwright
@@ -2773,7 +3654,7 @@ async def query_uniuni_tracking(tracking_no: str) -> dict[str, Any]:
                 except Exception:
                     title = ''
                 html = await page.content()
-                debug_dir = (Path(__file__).resolve().parent / 'tmp' / 'uniuni-debug' / datetime.now().strftime('%Y-%m-%d'))
+                debug_dir = _build_platform_debug_dir('uniuni', datetime.now().strftime('%Y-%m-%d'))
                 debug_dir.mkdir(parents=True, exist_ok=True)
                 html_path = debug_dir / f'{normalized}.html'
                 screenshot_path = debug_dir / f'{normalized}.png'
@@ -2786,41 +3667,52 @@ async def query_uniuni_tracking(tracking_no: str) -> dict[str, Any]:
 
             tracking_locator = page.locator(f'div:has-text("{normalized}")').first
 
-            for attempt in range(1, 4):
-                if attempt == 1:
-                    await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
-                else:
-                    logger.warning("UNIUNI 查询: 页面未返回轨迹，刷新重试 tracking_no=%s attempt=%s", normalized, attempt - 1)
-                    await page.reload(wait_until='domcontentloaded', timeout=60000)
+            try:
+                for attempt in range(1, 4):
+                    if attempt == 1:
+                        await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
+                    else:
+                        logger.warning("UNIUNI 查询: 页面未返回轨迹，刷新重试 tracking_no=%s attempt=%s", normalized, attempt - 1)
+                        await page.reload(wait_until='domcontentloaded', timeout=60000)
 
-                try:
-                    await page.wait_for_load_state('networkidle', timeout=20000)
-                except PlaywrightTimeoutError:
-                    await page.wait_for_timeout(3000)
-
-                try:
-                    await tracking_locator.wait_for(timeout=30000)
-                except PlaywrightTimeoutError:
-                    await page.wait_for_timeout(3000)
-
-                if await tracking_locator.count() == 0:
-                    continue
-
-                for click_attempt in range(2):
                     try:
-                        await tracking_locator.click(timeout=10000)
-                    except Exception:
+                        await page.wait_for_load_state('networkidle', timeout=20000)
+                    except PlaywrightTimeoutError:
+                        await page.wait_for_timeout(3000)
+
+                    try:
+                        await tracking_locator.wait_for(timeout=30000)
+                    except PlaywrightTimeoutError:
+                        await page.wait_for_timeout(3000)
+
+                    if await tracking_locator.count() == 0:
                         continue
-                    await page.wait_for_timeout(2500 if click_attempt == 0 else 3500)
+
+                    await tracking_locator.click(timeout=10000)
+                    await page.wait_for_timeout(2500)
                     html = await page.content()
                     items = extract_uniuni_tracking_items_from_html(html)
-                    if items:
-                        return {
-                            '平台': 'UNIUNI',
-                            '查询值': normalized,
-                            '物流轨迹': items,
-                            '最新轨迹': items[0],
-                        }
+                    if not items:
+                        continue
+
+                    return {
+                        '平台': 'UNIUNI',
+                        '查询值': normalized,
+                        '物流轨迹': items,
+                        '最新轨迹': items[0],
+                    }
+            except Exception as exc:
+                title, current_url, html_path = await _dump_debug_artifacts()
+                return {
+                    '平台': 'UNIUNI',
+                    '查询值': normalized,
+                    '物流轨迹': [],
+                    '最新轨迹': {},
+                    '错误': str(exc) or 'UNIUNI 查询异常',
+                    '当前页面标题': title,
+                    '当前URL': current_url,
+                    '调试HTML': html_path,
+                }
 
             title, current_url, html_path = await _dump_debug_artifacts()
             if await tracking_locator.count() == 0:
@@ -3007,7 +3899,7 @@ async def query_gofo_tracking(tracking_no: str) -> dict[str, Any]:
                     '错误': 'GOFO 导出文件缺少 Current status 字段',
                 }
 
-            latest_track = {'时间': '', '内容': current_status, '地点': ''}
+            latest_track = build_gofo_latest_track(row)
             return {
                 '平台': 'GOFO',
                 '查询值': normalized,
@@ -3077,7 +3969,7 @@ async def query_ups_tracking(tracking_no: str) -> dict[str, Any]:
                 html = await page.content()
                 status = extract_ups_current_status_from_html(html)
                 if status:
-                    latest_track = {'时间': '', '内容': status, '地点': ''}
+                    latest_track = {'时间': extract_ups_latest_time_from_html(html), '内容': status, '地点': ''}
                     return {
                         '平台': 'UPS',
                         '查询值': normalized,
@@ -3178,7 +4070,7 @@ async def query_yuntrack_tracking(tracking_no: str) -> dict[str, Any]:
                     '错误': 'YunTrack 导出文件缺少 Delivery Status 字段',
                 }
 
-            latest_track = {'时间': '', '内容': delivery_status, '地点': ''}
+            latest_track = build_yuntrack_latest_track(row)
             return {
                 '平台': 'YUNTRACK',
                 '查询值': normalized,
