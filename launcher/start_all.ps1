@@ -1,7 +1,9 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
-$ProjectDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
+$ProjectDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $ProjectDir
 
 function Read-DotEnv {
@@ -137,11 +139,9 @@ function Ensure-SharedCdp {
         Write-Host "Shared CDP is ready: $($env:LOCAL_CDP_URL)"
         return
     }
-
     if ($env:LOCAL_CDP_HOST -notin @("127.0.0.1", "localhost")) {
         throw "Shared CDP is not reachable at $($env:LOCAL_CDP_URL). Remote CDP must be started separately."
     }
-
     if (-not $env:LOCAL_CDP_BROWSER_BIN) {
         $env:LOCAL_CDP_BROWSER_BIN = Resolve-SystemBrowser
     }
@@ -177,11 +177,44 @@ function Ensure-SharedCdp {
     throw "Shared CDP did not become ready: $($env:LOCAL_CDP_URL). Chrome may have attached to an existing profile without enabling remote debugging. Close all Chrome/Edge processes and remove LOCAL_CDP_USER_DATA_DIR: $($env:LOCAL_CDP_USER_DATA_DIR)"
 }
 
-$VenvPython = Join-Path $ProjectDir ".venv\Scripts\python.exe"
-if (Test-Path $VenvPython) {
-    $PythonExe = $VenvPython
-} else {
-    $PythonExe = "python"
+function Test-NapCatHttp {
+    param(
+        [string]$BaseUrl,
+        [string]$Token = ""
+    )
+    try {
+        $Headers = @{}
+        if ($Token) {
+            $Headers = @{ 'Authorization' = "Bearer $Token" }
+        }
+        $Response = Invoke-RestMethod `
+            -Method Post `
+            -Uri (($BaseUrl.TrimEnd("/")) + "/get_status") `
+            -Headers $Headers `
+            -ContentType "application/json" `
+            -Body "{}" `
+            -TimeoutSec 3
+        return $null -ne $Response
+    } catch {
+        return $false
+    }
+}
+
+function Wait-NapCatHttp {
+    param(
+        [string]$BaseUrl,
+        [string]$Token,
+        [int]$WaitSeconds
+    )
+
+    $Deadline = (Get-Date).AddSeconds($WaitSeconds)
+    while ((Get-Date) -lt $Deadline) {
+        if (Test-NapCatHttp -BaseUrl $BaseUrl -Token $Token) {
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "NapCat HTTP API is not available at $BaseUrl after $WaitSeconds seconds."
 }
 
 $EnvValues = Merge-DotEnvFiles -Paths @(
@@ -189,19 +222,50 @@ $EnvValues = Merge-DotEnvFiles -Paths @(
     (Join-Path $ProjectDir ".env.windows")
 )
 
-if (-not $env:API_HOST -and $EnvValues["API_HOST"]) {
-    $env:API_HOST = $EnvValues["API_HOST"]
+$QQApiBaseUrl = $EnvValues["QQ_API_BASE_URL"]
+if (-not $QQApiBaseUrl) {
+    $QQApiBaseUrl = "http://127.0.0.1:6702"
 }
-if (-not $env:API_PORT -and $EnvValues["API_PORT"]) {
-    $env:API_PORT = $EnvValues["API_PORT"]
+$QQApiToken = $EnvValues["QQ_API_TOKEN"]
+if (-not $QQApiToken) {
+    $QQApiToken = ""
 }
-if (-not $env:API_AUTH_TOKEN -and $EnvValues["API_AUTH_TOKEN"]) {
-    $env:API_AUTH_TOKEN = $EnvValues["API_AUTH_TOKEN"]
+
+$NapCatWaitSeconds = 90
+if ($EnvValues["NAPCAT_WAIT_SECONDS"]) {
+    $NapCatWaitSeconds = [int]$EnvValues["NAPCAT_WAIT_SECONDS"]
+}
+
+$NapCatLauncher = $EnvValues["NAPCAT_LAUNCHER_PATH"]
+if (-not $NapCatLauncher) {
+    $NapCatLauncher = Join-Path $ProjectDir "NapCat.Shell\launcher.bat"
+}
+if (-not [System.IO.Path]::IsPathRooted($NapCatLauncher)) {
+    $NapCatLauncher = Join-Path $ProjectDir $NapCatLauncher
+}
+
+if (-not (Test-NapCatHttp -BaseUrl $QQApiBaseUrl -Token $QQApiToken)) {
+    if (-not (Test-Path $NapCatLauncher)) {
+        throw "NapCat launcher not found: $NapCatLauncher. Put NapCat.Shell under the project root or set NAPCAT_LAUNCHER_PATH in .env."
+    }
+    Start-Process -FilePath $NapCatLauncher -WorkingDirectory (Split-Path -Parent $NapCatLauncher)
+    Wait-NapCatHttp -BaseUrl $QQApiBaseUrl -Token $QQApiToken -WaitSeconds $NapCatWaitSeconds
+}
+
+$ConfiguredPython = $env:DINGTALK_PYTHON_EXE
+$VenvPython = Join-Path $ProjectDir ".venv\Scripts\python.exe"
+if ($ConfiguredPython) {
+    # The double-click launcher supplies "python" from the selected Conda environment.
+    $PythonExe = $ConfiguredPython
+} elseif (Test-Path $VenvPython) {
+    $PythonExe = $VenvPython
+} else {
+    $PythonExe = "python"
 }
 
 Ensure-SharedCdp -EnvValues $EnvValues
 
-$ApiHost = if ($env:API_HOST) { $env:API_HOST } else { "0.0.0.0" }
-$ApiPort = if ($env:API_PORT) { $env:API_PORT } else { "18081" }
+$ApiHost = if ($EnvValues["API_HOST"]) { $EnvValues["API_HOST"] } else { "0.0.0.0" }
+$ApiPort = if ($EnvValues["API_PORT"]) { $EnvValues["API_PORT"] } else { "18081" }
 
-& $PythonExe -m uvicorn api_server:app --host $ApiHost --port $ApiPort
+& $PythonExe (Join-Path $ProjectDir 'launcher\run_all.py') --api-host $ApiHost --api-port $ApiPort

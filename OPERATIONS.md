@@ -11,7 +11,7 @@
 - 回复 `1` 后进入持续 `FBA查询` 模式，直到回复 `重置`。
 - 回复 `2` 后进入持续 `跟踪号查询` 模式，直到回复 `重置`。
 - 跟踪号查询不查钉钉表格，而是按前缀走平台官网，未命中特殊前缀时回退到 `17track`。
-- `uniuni` 当前已接入直达 `tracking-detail` URL 的页面查询，并从 UniUni 页面轨迹区提取事件。
+- `uniuni` 当前已接入直达 `tracking-detail` URL 的页面查询，并从详情页 `Tracking History` 直接读取轨迹。
 - `gofo` 当前已接入 `Export Summary` 导出流程，并从导出文件中读取 `Current status` 作为状态结果。
 - `usps` 当前已接入详情页轨迹抓取，并读取全部 `tb-step` 状态块作为轨迹列表。
 - `ups` 当前已接入详情页当前状态抓取，并读取激活中的进度步骤文本作为状态结果。
@@ -35,8 +35,8 @@
   - 使用钉钉表里的 `物流编号` 作为 `BookingID`
   - 通过 Playwright 查询 AGL 页面
 - `平谊` -> `平谊系统`
-  - 直接使用用户在钉钉中发送的单号查询
-  - 不依赖钉钉表里的 `物流编号`
+  - 直接使用用户在钉钉中发送的 FBA 编号查询
+  - 调用软通宝 `PublicService` 的 `getTrack` 接口，不依赖浏览器或钉钉表里的 `物流编号`
 - `堡森` -> `堡森系统`
   - 使用钉钉表里的 `物流编号`
   - 通过 Playwright 查询堡森页面
@@ -47,6 +47,9 @@
 - `大黄蜂` -> `17TRACK`
   - 使用钉钉表里的 `物流编号`
   - 打开 `https://www.17track.net/zh-cn` 查询轨迹
+- `盈和` -> `盈和系统`
+  - 使用钉钉表里的 `物流编号`
+  - 打开 `http://www.gjwl.yhwl.com:8027/`，提交物流编号后展开运单和子单读取轨迹
 - 其他货代公司 -> `美通`
   - 使用钉钉表里的 `物流编号`
   - 走接口查询
@@ -64,16 +67,17 @@
 ## AGL
 1. 打开 `https://www.agl.amazon.com/freight-puma`。
 2. 代码会自动启动本地 CDP Chrome，并通过 `Playwright + CDP` 连接浏览器。
-3. 根据品牌选择对应账号密码，账号密码来自 `.env`。
-4. 使用 `物流编号` 作为 `BookingID` 打开追踪页。
-5. 查询完成后尝试退出登录，再关闭当前浏览器。
+3. 根据品牌选择对应账号密码，账号密码来自 `.env`：`LIBRATON`、`PACMANN` 使用 `AGL_USERNAME`；`YPLUS` 使用 `AGL_YPLUS_USERNAME`。未配置紫鸟环境时，`EZARC`、`TOLESA` 使用 `AGL_EASYCAN_USERNAME`。
+4. 配置 `AGL_EASYCAN_ZINIAO_BROWSER_ID` 后，`EZARC`、`TOLESA` 改用同一紫鸟 WebDriver 环境。项目通过紫鸟本机 HTTP 服务启动或复用该环境，从响应的 `debuggingPort` 附加 Playwright 并查询 AGL；不会填写 AGL 账号密码、保存项目会话、退出 AGL、关闭紫鸟环境或关闭紫鸟客户端。可访问的紫鸟调试端口会保存到 `ZINIAO_BROWSER_STATE_PATH`（默认 `tmp/ziniao-browser-ports.json`），供机器人重启后继续复用；只有端口不可达时才会重新调用紫鸟打开环境。须在本机 `.env` 设置 `ZINIAO_COMPANY`、`ZINIAO_USERNAME`、`ZINIAO_PASSWORD`、`ZINIAO_WEBDRIVER_PORT`（默认 `16851`）和 `ZINIAO_CLIENT_PATH`。若服务未启动，项目会以 `ZINIAO_CLIENT_PATH --run_type=web_driver --ipc_type=http --port=<端口>` 启动紫鸟；已有普通紫鸟客户端实例时，应先在客户端侧完全退出，再由项目启动 WebDriver 实例。
+5. 非紫鸟账号的会话分别保存到 `AGL_SESSION_STATE_DIR`（默认 `data/agl-sessions`）。首次出现登录页或验证码时，在打开的 AGL 窗口内完成验证，系统默认等待 120 秒；成功后后续查询会复用对应账号会话。可通过 `AGL_MANUAL_VERIFICATION_WAIT_SECONDS` 设置等待时间（30 到 600 秒）。页面登录成功后，轨迹组件默认最多等待 30 秒，可通过 `AGL_TRACKING_RENDER_WAIT_SECONDS` 设置（10 到 60 秒）。
+5. 使用 `物流编号` 作为 `BookingID` 打开追踪页。
 
 ## 平谊
-1. 打开登录页 `http://hzpy.rtb56.com/login.aspx`。
-2. 输入账号密码并处理验证码，账号密码来自 `.env`。
-3. 登录后进入运单查询页面。
-4. 直接用用户在钉钉中发送的单号查询。
-5. 打开详情并提取轨迹。
+1. 请求 `http://hzpy.rtb56.com/webservice/PublicService.asmx/ServiceInterfaceUTF8`。
+2. 使用 `application/x-www-form-urlencoded` 提交 `appToken`、`appKey`、`serviceMethod=getTrack` 和 `paramsJson`。
+3. `paramsJson` 为 `{"tracking_number":"<FBA编号或跟踪号>"}`；FBA 查询默认传用户输入的 FBA 编号。
+4. 从 `data[0].details` 读取 `track_occur_date`、`track_description`、`track_location` 和 `track_code`。
+5. 在 `.env` 配置 `PINGYI_BASE_URL`、`PINGYI_APP_TOKEN`、`PINGYI_APP_KEY`；可用 `PINGYI_API_TIMEOUT_SECONDS` 设置单次 HTTP 超时，默认 20 秒，范围 5 到 60 秒。
 
 ## 堡森
 1. 打开堡森官网页面。
@@ -90,15 +94,14 @@
 5. 通过 NapCat OneBot HTTP API 发消息并轮询群消息。
 6. 命中对方第一条新回复后返回。
 7. 本机需要先启动 NapCat，并暴露 HTTP API 到 `QQ_API_BASE_URL`。
-8. 启动后可执行 `python scripts/setup_qq_route.py --write-env` 自动写入 `QQ_JINWEI_GROUP_ID` 和 `QQ_JINWEI_USER_ID`。
+8. 在 `.env` 中手动填写 `QQ_JINWEI_GROUP_ID` 和 `QQ_JINWEI_USER_ID`。
 
 ## Windows + NapCatQQ 运行
 1. 在 Windows 上运行本项目时，建议直接使用 Windows Python，不通过 WSL 启动浏览器。
 2. 安装依赖:
-   - `py -3.11 -m venv .venv`
-   - `.\.venv\Scripts\Activate.ps1`
-   - `pip install -r requirements.txt`
-   - `python -m playwright install chromium`
+   - `conda create -y -n dingtalk-bot python=3.11`
+   - `conda run -n dingtalk-bot python -m pip install -r requirements.txt`
+   - `conda run -n dingtalk-bot python -m playwright install chromium`
 3. 启动 NapCatQQ:
    - 下载 `NapCat.Shell.zip`
    - 解压到本项目 `NapCat.Shell`
@@ -116,24 +119,24 @@
    - `NAPCAT_LAUNCHER_PATH=NapCat.Shell\launcher.bat`
    - `NAPCAT_WAIT_SECONDS=90`
    - `LOCAL_CDP_USER_DATA_DIR=./data/chrome-cdp-windows`
-6. NapCat HTTP 服务启动后执行:
-   - `python scripts\setup_qq_route.py --write-env`
-7. 只启动机器人:
-   - `.\scripts\windows\start_bot.ps1`
-   - 兼容入口: `.\start_bot.ps1`
-8. 启动 NapCatQQ 并启动机器人:
-   - `.\scripts\windows\start_all.ps1`
-   - 兼容入口: `.\start_all.ps1`
+6. 直接双击 `start_all.bat` 启动 NapCatQQ、本地 API 和机器人。
+   - 使用 `dingtalk-bot` Conda 环境，需确保 `conda` 已加入 PATH。
 
 ## 17TRACK
 1. 当前只配置了 `大黄蜂`。
-2. 打开 `https://www.17track.net/zh-cn`。
-3. 当前跟踪号查询模式会直接打开新版英文直达页：
+2. 当前跟踪号查询模式会直接打开新版英文直达页：
    - `https://t.17track.net/en#nums=<物流编号>`
-4. 页面加载后直接提取轨迹时间线。
-5. 如果出现引导弹窗，只关闭右上角 `×`，不点“下一页”。
-6. 如果遇到验证码或人工验证，程序会暂停等待人工处理，再继续抓取结果。
+3. 页面加载后直接提取轨迹时间线。
+4. 如果出现引导弹窗，会尝试关闭或完成引导后继续查询。
+5. 如果遇到验证码或人工验证，程序会暂停等待人工处理，再继续抓取结果。
+6. 单次查询默认最多等待 25 秒，超时后关闭查询页并走重试；可通过 `TRACKING_17TRACK_MAX_WAIT_SECONDS` 配置，取值范围为 10 到 90 秒。
 7. 当前运行方式为本机直接启动浏览器。
+
+## 查询超时
+- 异步网页查询平台单次默认最多运行 45 秒，超时会关闭页面、释放浏览器队列并重试。
+- 可用 `TRACKING_QUERY_ATTEMPT_TIMEOUT_SECONDS` 配置全局单次上限，取值范围为 10 到 180 秒。
+- 单个平台可用 `TRACKING_<平台>_ATTEMPT_TIMEOUT_SECONDS` 覆盖，例如 `TRACKING_USPS_ATTEMPT_TIMEOUT_SECONDS=75`。
+- AGL、QQ、美通使用各自的同步调用与网络超时，不走协程强制取消，避免旧任务仍在运行时误释放队列；平谊已改用 HTTP API，不再占用浏览器队列。
 
 ## 本机运行现状
 - 应用直接在本机 Python 环境中运行。
@@ -198,42 +201,17 @@
    - 如需走指定代理，再补 `GEWECHAT_PROXY_IP`
    - 如果当前网络无法连设备节点，优先切换到稳定的中国大陆网络，最好与手机同省
 
-## 本机启动建议
-1. 安装项目依赖:
-   - `conda create -y -n dingtalk-ltq-bot python=3.11`
-   - `conda run -n dingtalk-ltq-bot python -m pip install -r requirements.txt`
-2. 准备 Chrome:
-   - 默认读取 `CHROME_BIN=/usr/bin/google-chrome`
-3. 如需网页自动化浏览器:
-   - `conda run -n dingtalk-ltq-bot python -m playwright install chromium`
-4. 如需 QQ 查询:
-   - 本机启动 NapCat / OneBot HTTP 服务
-   - 确认 `.env` 中 `QQ_API_BASE_URL` 和 `QQ_API_TOKEN`
-   - 执行 `conda run -n dingtalk-ltq-bot python scripts/setup_qq_route.py --write-env`
-5. 启动机器人:
-   - `conda run -n dingtalk-ltq-bot bash scripts/linux/start_bot.sh`
-   - 兼容入口: `conda run -n dingtalk-ltq-bot bash start_bot.sh`
-6. 如果只想单独测试本地 CDP Chrome:
-   - `bash scripts/linux/start_host_cdp.sh 19444 visible`
-   - 兼容入口: `bash start_host_cdp.sh 19444 visible`
-
-## 双平台运行约定
+## Windows 运行约定
 - 统一本地 API 端口: `18081`
 - 统一本地 CDP 端口: `19444`
 - API 和机器人统一连接同一套 CDP 浏览器；`LOCAL_CDP_EXTERNAL_ONLY=true` 时，业务进程不会再自行启动第二个浏览器
 - `LOCAL_CDP_STOP_WHEN_IDLE=false` 时查询结束后保留共享浏览器；改成 `true` 才会在所有会话结束后自动关闭
 - Windows 启动脚本会优先复用 `LOCAL_CDP_URL`，不可用时用系统 Chrome/Edge 启动共享 CDP，不再自动选择 Playwright 的 `Google for Testing`
 - Windows 配置模板: `.env.windows.example`
-- Linux / WSL 配置模板: `.env.linux.example`
 - Windows 启动脚本会优先读取 `.env.windows`，再回退到 `.env`
-- Linux / WSL 启动脚本会优先读取 `.env.linux`，再回退到 `.env`
-- Windows API 启动: `.\scripts\windows\start_api.ps1`
-- Linux / WSL API 启动: `bash ./scripts/linux/start_api.sh`
-- Linux / WSL 机器人启动: `bash ./scripts/linux/start_bot_linux.sh`
-- Windows 全量启动: `.\scripts\windows\start_all.ps1` 会在同一个终端聚合 API 和机器人日志，日志前缀分别为 `[api]`、`[bot]`
-- 根目录旧脚本保留为兼容壳，后续统一使用 `scripts/` 下的新路径
+- Windows 启动: 直接双击 `start_all.bat`（同时启动 API 和机器人）
+- `start_all.bat` 会在同一个终端聚合 API 和机器人日志，日志前缀分别为 `[api]`、`[bot]`
 - Windows 主执行环境继续优先承载 `QQ / NapCat / Windows Playwright` 相关能力。
-- Linux / WSL 执行环境用于兼容运行 API、浏览器查询和无 Windows 桌面依赖的平台。
 
 ## 公网 API 网关方案
 - 推荐架构:
@@ -252,6 +230,12 @@
   - 云主机本地隧道: `18781`
   - 本机 API: `18081`
 
+## USPS 风控应对
+- USPS 查询不要用 headless；优先复用宿主 Chrome 的默认 context，避免空 cookie/context 触发 Akamai 风控。
+- 首次使用时，可在共享 Chrome 中手动打开 `usps.com` / `tools.usps.com`，保存 cookie 和本地存储。
+- USPS 被拦或最终失败时，会把调试文件写到 `tmp/usps-debug/<日期>/<单号>/attempt-*/`。
+- 调试目录至少包含 `dom.html`、`screenshot.png`、`url.txt`、`title.txt`，先看这些再决定是否继续调 stealth。
+
 ## 当前代码里的真实平台枚举
 - `auto`
 - `agl`
@@ -260,4 +244,5 @@
 - `baosen`
 - `qq`
 - `17track`
+- `yinghe`
 - `none`

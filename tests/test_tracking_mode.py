@@ -1,4 +1,6 @@
+import asyncio
 import sys
+import time
 import types
 import unittest
 from unittest.mock import AsyncMock
@@ -82,6 +84,73 @@ class TrackingModeMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(replies), 1)
         self.assertIn("请选择要办理的业务", replies[0])
 
+    async def test_menu_reply_does_not_block_event_loop(self):
+        handler, _ = self._make_handler()
+
+        def slow_reply(_text, _incoming_message):
+            time.sleep(0.05)
+
+        handler.reply_text = slow_reply
+
+        started_at = time.perf_counter()
+        handle_task = asyncio.create_task(handler._handle_text_message(self._make_message("hello"), "hello"))
+        await asyncio.sleep(0.001)
+        elapsed = time.perf_counter() - started_at
+        await handle_task
+
+        self.assertLess(elapsed, 0.03)
+
+    async def test_process_replies_error_message_when_handler_raises(self):
+        handler, main = self._make_handler()
+        replies = []
+        handler.reply_text = lambda text, incoming_message: replies.append(text)
+        callback = SimpleNamespace(data=self._make_message("UL228444795YP"))
+
+        with patch.object(handler, "_handle_text_message", new=AsyncMock(side_effect=RuntimeError("17TRACK 未找到查询输入框"))):
+            status, message = await handler.process(callback)
+
+        self.assertEqual(status, main.dingtalk_stream.AckMessage.STATUS_OK)
+        self.assertEqual(message, "ERROR")
+        self.assertEqual(replies, ["❌ 查询失败: 17TRACK 未找到查询输入框"])
+
+    async def test_first_fba_message_auto_enters_fba_mode(self):
+        handler, _ = self._make_handler()
+        replies = []
+        handler.reply_text = lambda text, incoming_message: replies.append(text)
+
+        with patch.object(handler, "_handle_fba_message", new=AsyncMock()) as fba_mock:
+            await handler._handle_text_message(self._make_message("FBA15LM2YS86"), "FBA15LM2YS86")
+
+        self.assertEqual(handler._conversation_modes["cid-1"], "fba")
+        self.assertEqual(replies, [])
+        fba_mock.assert_awaited_once_with(self._make_message("FBA15LM2YS86"), "FBA15LM2YS86")
+
+    async def test_first_tracking_message_auto_enters_tracking_mode(self):
+        handler, _ = self._make_handler()
+        replies = []
+        handler.reply_text = lambda text, incoming_message: replies.append(text)
+
+        message = self._make_message("9434650105495028445440")
+        with patch.object(handler, "_handle_tracking_message", new=AsyncMock()) as tracking_mock:
+            await handler._handle_text_message(message, "9434650105495028445440")
+
+        self.assertEqual(handler._conversation_modes["cid-1"], "tracking")
+        self.assertEqual(replies, [])
+        tracking_mock.assert_awaited_once_with(message, "9434650105495028445440")
+
+    async def test_first_17track_fallback_message_auto_enters_tracking_mode(self):
+        handler, _ = self._make_handler()
+        replies = []
+        handler.reply_text = lambda text, incoming_message: replies.append(text)
+
+        message = self._make_message("UL228444795YP")
+        with patch.object(handler, "_handle_tracking_message", new=AsyncMock()) as tracking_mock:
+            await handler._handle_text_message(message, "UL228444795YP")
+
+        self.assertEqual(handler._conversation_modes["cid-1"], "tracking")
+        self.assertEqual(replies, [])
+        tracking_mock.assert_awaited_once_with(message, "UL228444795YP")
+
     async def test_reset_replays_business_menu(self):
         handler, _ = self._make_handler()
         replies = []
@@ -160,6 +229,73 @@ class TrackingModeMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("开始查询跟踪号 UUS123456789", replies[0])
         self.assertIn("最新物流轨迹", replies[1])
         self.assertIn("https://www.uniuni.com//tracking#tracking-detail?no=UUS123456789", replies[1])
+
+    async def test_tracking_mode_retries_browser_tracking_result_errors(self):
+        handler, main = self._make_handler()
+        replies = []
+        attempts = 0
+        handler.reply_text = lambda text, incoming_message: replies.append(text)
+        handler._conversation_modes["cid-1"] = "tracking"
+
+        async def fake_query_tracking_number(tracking_no: str):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return {
+                    "平台": "USPS",
+                    "查询值": tracking_no,
+                    "物流轨迹": [],
+                    "最新轨迹": {},
+                    "错误": "USPS 查询提交失败: Locator.wait_for: Timeout 12000ms exceeded.",
+                }
+            latest = {"时间": "June 22, 2026 1:18 PM", "内容": "Delivered - Delivered, In/At Mailbox", "地点": ""}
+            return {
+                "平台": "USPS",
+                "查询值": tracking_no,
+                "物流轨迹": [latest],
+                "最新轨迹": latest,
+            }
+
+        with (
+            patch.object(main, "query_tracking_number", side_effect=fake_query_tracking_number),
+            patch.object(main, "_TRACK_QUERY_RETRY_DELAY_SECONDS", 0),
+        ):
+            await handler._handle_tracking_query(self._make_message("9235990411372808070855"), "9235990411372808070855")
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(replies), 2)
+        self.assertIn("开始查询跟踪号 9235990411372808070855", replies[0])
+        self.assertIn("Delivered - Delivered, In/At Mailbox", replies[1])
+
+    async def test_tracking_mode_does_not_retry_fedex_system_error(self):
+        handler, main = self._make_handler()
+        replies = []
+        attempts = 0
+        handler.reply_text = lambda text, incoming_message: replies.append(text)
+        handler._conversation_modes["cid-1"] = "tracking"
+
+        async def fake_query_tracking_number(tracking_no: str):
+            nonlocal attempts
+            attempts += 1
+            return {
+                "平台": "FEDEX",
+                "查询值": tracking_no,
+                "物流轨迹": [],
+                "最新轨迹": {},
+                "错误": "FedEx 系统错误页，暂时无法查询",
+                "当前URL": f"https://www.fedex.com/fedextrack/system-error?trknbr={tracking_no}",
+            }
+
+        with (
+            patch.object(main, "query_tracking_number", side_effect=fake_query_tracking_number),
+            patch.object(main, "_TRACK_QUERY_RETRY_DELAY_SECONDS", 0),
+        ):
+            await handler._handle_tracking_query(self._make_message("382076759975"), "382076759975")
+
+        self.assertEqual(attempts, 1)
+        self.assertEqual(len(replies), 2)
+        self.assertIn("开始查询跟踪号 382076759975", replies[0])
+        self.assertIn("FedEx 系统错误页，暂时无法查询", replies[1])
 
     async def test_tracking_mode_rejects_empty_text(self):
         handler, _ = self._make_handler()
@@ -246,48 +382,53 @@ class TrackingModeMenuTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, expected)
 
-    async def test_query_tracking_number_routes_to_fedex_helper_for_38_prefix(self):
+    async def test_query_tracking_number_routes_fedex_prefix_to_17track(self):
         import logistics_query
 
         expected = {
-            "平台": "FEDEX",
+            "平台": "17TRACK",
             "查询值": "381685128780",
             "物流轨迹": [],
             "最新轨迹": {},
         }
 
-        with patch.object(logistics_query, "query_fedex_tracking", new=AsyncMock(return_value=expected), create=True):
+        with (
+            patch.object(logistics_query, "query_17track", new=AsyncMock(return_value=expected)) as query_17track_mock,
+            patch.object(logistics_query, "query_fedex_tracking", new=AsyncMock()) as query_fedex_mock,
+        ):
             result = await logistics_query.query_tracking_number("381685128780")
 
         self.assertEqual(result, expected)
+        query_17track_mock.assert_awaited_once_with("381685128780")
+        query_fedex_mock.assert_not_awaited()
 
-    async def test_query_tracking_number_routes_to_yuntrack_helper_for_h00rva(self):
+    async def test_query_tracking_number_routes_to_yuntrack_helper_for_yt(self):
         import logistics_query
 
         expected = {
             "平台": "YUNTRACK",
+            "查询值": "YT2616000701096085",
+            "物流轨迹": [],
+            "最新轨迹": {},
+        }
+
+        with patch.object(logistics_query, "query_yuntrack_tracking", new=AsyncMock(return_value=expected)):
+            result = await logistics_query.query_tracking_number("YT2616000701096085")
+
+        self.assertEqual(result, expected)
+
+    async def test_query_tracking_number_routes_h00rva_to_17track_fallback(self):
+        import logistics_query
+
+        expected = {
+            "平台": "17TRACK",
             "查询值": "H00RVA0498916385",
             "物流轨迹": [],
             "最新轨迹": {},
         }
 
-        with patch.object(logistics_query, "query_yuntrack_tracking", new=AsyncMock(return_value=expected)):
+        with patch.object(logistics_query, "query_17track", new=AsyncMock(return_value=expected)):
             result = await logistics_query.query_tracking_number("H00RVA0498916385")
-
-        self.assertEqual(result, expected)
-
-    async def test_query_tracking_number_routes_to_yuntrack_helper_for_gv(self):
-        import logistics_query
-
-        expected = {
-            "平台": "YUNTRACK",
-            "查询值": "GV123456789US",
-            "物流轨迹": [],
-            "最新轨迹": {},
-        }
-
-        with patch.object(logistics_query, "query_yuntrack_tracking", new=AsyncMock(return_value=expected)):
-            result = await logistics_query.query_tracking_number("GV123456789US")
 
         self.assertEqual(result, expected)
 

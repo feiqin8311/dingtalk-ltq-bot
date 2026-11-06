@@ -328,6 +328,8 @@ def _build_track(message: dict[str, Any]) -> dict[str, str]:
         track['附件'] = assets
     else:
         track['消息类型'] = '文本'
+    if _is_customs_clearance_message(message):
+        track['内容'] = '到港，清关中'
     return track
 
 
@@ -499,10 +501,22 @@ def _message_has_meaningful_text(message: dict[str, Any]) -> bool:
 
 
 def _is_non_logistics_notice_message(message: dict[str, Any]) -> bool:
+    if _is_customs_clearance_message(message):
+        return False
     text = _extract_message_text(message)
     if not text:
         text = clean_text(message.get('raw_message', ''))
     return any(keyword in text for keyword in _NON_LOGISTICS_NOTICE_KEYWORDS)
+
+
+def _is_customs_clearance_message(message: dict[str, Any]) -> bool:
+    text = _extract_message_text(message)
+    if not text:
+        text = clean_text(message.get('raw_message', ''))
+    if not text:
+        return False
+    has_tracking_like_token = bool(re.search(r'[A-Za-z]{2,}\d{6,}', text))
+    return '关税' in text and has_tracking_like_token
 
 
 def _find_history_matches(
@@ -540,27 +554,65 @@ def _find_history_matches(
 
 def _is_query_prompt_message(message: dict[str, Any], tracking_no: str, target_user_id: int) -> bool:
     payload = message.get('message')
-    if not isinstance(payload, list):
-        return False
-
     has_tracking_text = False
     has_target_at = False
-    for segment in payload:
-        if not isinstance(segment, dict):
-            continue
-        segment_type = clean_text(segment.get('type', '')).lower()
-        data = segment.get('data', {})
-        if not isinstance(data, dict):
-            continue
-        if segment_type == 'text':
-            text = clean_text(data.get('text', ''))
-            if tracking_no in text and '物流状态' in text:
-                has_tracking_text = True
-        elif segment_type == 'at':
-            qq = clean_text(data.get('qq', ''))
-            if qq == str(target_user_id):
-                has_target_at = True
+    if isinstance(payload, list):
+        for segment in payload:
+            if not isinstance(segment, dict):
+                continue
+            segment_type = clean_text(segment.get('type', '')).lower()
+            data = segment.get('data', {})
+            if not isinstance(data, dict):
+                continue
+            if segment_type == 'text':
+                text = clean_text(data.get('text', ''))
+                if tracking_no in text and '物流状态' in text:
+                    has_tracking_text = True
+            elif segment_type == 'at':
+                qq = clean_text(data.get('qq', ''))
+                if qq == str(target_user_id):
+                    has_target_at = True
+    else:
+        raw_text = ' '.join(
+            part
+            for part in (
+                clean_text(message.get('raw_message', '')),
+                clean_text(payload) if isinstance(payload, str) else '',
+            )
+            if part
+        )
+        if tracking_no in raw_text and '物流状态' in raw_text:
+            has_tracking_text = True
+        if (
+            f'@{target_user_id}' in raw_text
+            or f'qq={target_user_id}' in raw_text
+            or f'uin={target_user_id}' in raw_text
+        ):
+            has_target_at = True
     return has_tracking_text and has_target_at
+
+
+def _describe_message_for_debug(message: dict[str, Any]) -> str:
+    payload = message.get('message')
+    if isinstance(payload, list):
+        segment_types = ','.join(
+            clean_text(segment.get('type', '')) or '?'
+            for segment in payload
+            if isinstance(segment, dict)
+        )
+    elif isinstance(payload, str):
+        segment_types = 'raw-string'
+    else:
+        segment_types = type(payload).__name__
+
+    return (
+        f"id={message.get('message_id', '')} "
+        f"seq={message.get('message_seq', '')} "
+        f"time={message.get('time', '')} "
+        f"sender={_message_sender_id(message)} "
+        f"segments={segment_types} "
+        f"raw={clean_text(message.get('raw_message', ''))[:200]}"
+    )
 
 
 def _find_any_tracking_messages(
@@ -685,6 +737,71 @@ def _find_reply_messages(
             seen_message_ids.add(message_id)
         collected.append(message)
     return collected
+
+
+def _find_latest_prompt_message(
+    messages: list[dict[str, Any]],
+    tracking_no: str,
+    target_user_id: int,
+) -> dict[str, Any] | None:
+    for message in sorted(messages, key=_message_sort_key, reverse=True):
+        if _is_query_prompt_message(message, tracking_no, target_user_id):
+            return message
+    return None
+
+
+def _contains_any_tracking_like_token(message: dict[str, Any]) -> bool:
+    text = _extract_message_text(message)
+    if not text:
+        text = clean_text(message.get('raw_message', ''))
+    if not text:
+        return False
+    return bool(re.search(r'[A-Za-z]{2,}\d{6,}', text))
+
+
+def _collect_prompt_reply_chain(
+    messages: list[dict[str, Any]],
+    tracking_no: str,
+    target_user_id: int,
+    prompt_message: dict[str, Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    prompt_time = int(prompt_message.get('time') or 0)
+    prompt_seq = int(prompt_message.get('message_seq') or 0)
+    chain: list[dict[str, Any]] = []
+
+    ordered = sorted(messages, key=_message_sort_key)
+    for message in ordered:
+        if _message_sender_id(message) != str(target_user_id):
+            continue
+        message_time = int(message.get('time') or 0)
+        message_seq = int(message.get('message_seq') or 0)
+        if message_time and message_time < prompt_time:
+            continue
+        # NapCat 的 message_seq 在真实群历史里不保证与 time 同步单调递增。
+        # 有可靠时间戳时，以 time 为主；只有同秒或缺失 time 时，才退回 seq 做局部去重。
+        if (
+            message_seq
+            and message_seq <= prompt_seq
+            and (
+                (not message_time and not prompt_time)
+                or (message_time and prompt_time and message_time == prompt_time)
+            )
+        ):
+            continue
+        if _message_contains_tracking_no(message, tracking_no):
+            chain.append(message)
+        elif not chain and _extract_message_assets(message) and not _contains_any_tracking_like_token(message):
+            chain.append(message)
+        elif chain and _message_has_content(message) and not _contains_any_tracking_like_token(message):
+            chain.append(message)
+        elif chain and _contains_any_tracking_like_token(message):
+            break
+        else:
+            continue
+    if len(chain) > limit:
+        chain = chain[-limit:]
+    return list(reversed(chain))
 
 
 def send_qq_question(order: dict[str, Any], tracking_no: str) -> dict[str, Any]:
@@ -849,6 +966,85 @@ def query_qq(order: dict[str, Any], tracking_no: str, defer_if_stale: bool = Fal
                 history_tracks[0].get('时间'),
                 history_tracks[0].get('内容'),
             )
+        latest_prompt_message = _find_latest_prompt_message(
+            history_messages,
+            tracking_no=tracking_no,
+            target_user_id=user_id,
+        )
+        prompt_reply_tracks: list[dict[str, Any]] = []
+        if latest_prompt_message is not None:
+            context_window = max(1, get_qq_history_context_window())
+            prompt_replies = _collect_prompt_reply_chain(
+                history_messages,
+                tracking_no=tracking_no,
+                target_user_id=user_id,
+                prompt_message=latest_prompt_message,
+                limit=context_window,
+            )
+            prompt_reply_tracks = [_build_track(reply) for reply in prompt_replies]
+            if prompt_reply_tracks:
+                logger.info(
+                    "QQ历史最近一次询问后回复: tracking=%s 条数=%s 最新=%s | %s",
+                    tracking_no,
+                    len(prompt_reply_tracks),
+                    prompt_reply_tracks[0].get('时间'),
+                    prompt_reply_tracks[0].get('内容'),
+                )
+                return {
+                    '平台': 'QQ',
+                    '查询值': tracking_no,
+                    '群名': route_rule.group_name,
+                    '群号': str(group_id),
+                    '询问对象': display_name,
+                    '询问对象QQ': str(user_id),
+                    '提问内容': '',
+                    '发送消息ID': '',
+                    '回复消息ID': str(prompt_replies[0].get('message_id') or ''),
+                    '结果来源': '群历史(按最近一次QQ询问后的连续回复匹配)',
+                    '物流轨迹': prompt_reply_tracks,
+                    '最新轨迹': prompt_reply_tracks[0],
+                }
+            logger.info(
+                "QQ历史最近一次询问后无连续回复: tracking=%s prompt={%s}",
+                tracking_no,
+                _describe_message_for_debug(latest_prompt_message),
+            )
+            ordered_messages = sorted(history_messages, key=_message_sort_key)
+            try:
+                prompt_index = next(
+                    index
+                    for index, message in enumerate(ordered_messages)
+                    if str(message.get('message_id') or '') == str(latest_prompt_message.get('message_id') or '')
+                )
+            except StopIteration:
+                prompt_index = max(0, len(ordered_messages) - 1)
+            context_span = max(1, get_qq_history_context_window()) + 5
+            nearby_messages = ordered_messages[prompt_index:prompt_index + context_span]
+            for index, message in enumerate(nearby_messages, start=1):
+                logger.info(
+                    "QQ历史询问后上下文[%s]: tracking=%s %s",
+                    index,
+                    tracking_no,
+                    _describe_message_for_debug(message),
+                )
+        else:
+            candidate_messages = [
+                message
+                for message in sorted(history_messages, key=_message_sort_key, reverse=True)
+                if (
+                    _message_contains_tracking_no(message, tracking_no)
+                    or '物流状态' in clean_text(message.get('raw_message', ''))
+                )
+            ][:8]
+            if candidate_messages:
+                logger.info("QQ历史未找到最近一次询问: tracking=%s 候选如下", tracking_no)
+                for index, message in enumerate(candidate_messages, start=1):
+                    logger.info(
+                        "QQ历史询问候选[%s]: tracking=%s %s",
+                        index,
+                        tracking_no,
+                        _describe_message_for_debug(message),
+                    )
         latest_history_message = history_matches[0] if history_matches else None
         history_is_stale = bool(
             latest_history_message
@@ -891,8 +1087,8 @@ def query_qq(order: dict[str, Any], tracking_no: str, defer_if_stale: bool = Fal
                     '提问内容': question_text,
                     '发送消息ID': '',
                     '回复消息ID': str(history_matches[0].get('message_id') or ''),
-                    '结果来源': '群历史已超过7天，已重新发起QQ人工询问',
-                    '需要QQ询问': True,
+                    '结果来源': '群历史已超过7天',
+                    '提示': '消息已7天未更新，请询问单证',
                     '物流轨迹': history_tracks,
                     '最新轨迹': history_tracks[0],
                 }
@@ -906,8 +1102,8 @@ def query_qq(order: dict[str, Any], tracking_no: str, defer_if_stale: bool = Fal
                 '询问对象QQ': str(user_id),
                 '提问内容': question_text,
                 '发送消息ID': '',
-                '结果来源': '群历史无7天内李美慧消息，已重新发起QQ人工询问',
-                '需要QQ询问': True,
+                '结果来源': '群历史无7天内李美慧消息',
+                '提示': '消息已7天未更新，请询问单证',
                 '物流轨迹': history_tracks,
                 '最新轨迹': history_tracks[0] if history_tracks else {},
             }

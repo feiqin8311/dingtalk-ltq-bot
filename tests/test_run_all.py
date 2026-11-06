@@ -1,10 +1,12 @@
 import io
+import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import scripts.run_all as run_all
+import launcher.run_all as run_all
 
 
 class _FakeThread:
@@ -32,11 +34,11 @@ class _FakeProcess:
 
 class RunAllTests(unittest.TestCase):
     @patch.object(run_all, "_missing_modules", return_value=[])
-    @patch("scripts.run_all.signal.signal")
-    @patch("scripts.run_all.threading.Thread", side_effect=lambda *args, **kwargs: _FakeThread(*args, **kwargs))
-    @patch("scripts.run_all._terminate_process")
+    @patch("launcher.run_all.signal.signal")
+    @patch("launcher.run_all.threading.Thread", side_effect=lambda *args, **kwargs: _FakeThread(*args, **kwargs))
+    @patch("launcher.run_all._terminate_process")
     @patch("builtins.input", return_value="")
-    @patch("scripts.run_all.subprocess.Popen")
+    @patch("launcher.run_all.subprocess.Popen")
     def test_main_waits_for_enter_after_child_failure(
         self,
         popen_mock,
@@ -60,11 +62,11 @@ class RunAllTests(unittest.TestCase):
         self.assertTrue(terminate_mock.called)
 
     @patch.object(run_all, "_missing_modules", return_value=[])
-    @patch("scripts.run_all.signal.signal")
-    @patch("scripts.run_all.threading.Thread", side_effect=lambda *args, **kwargs: _FakeThread(*args, **kwargs))
-    @patch("scripts.run_all._terminate_process")
+    @patch("launcher.run_all.signal.signal")
+    @patch("launcher.run_all.threading.Thread", side_effect=lambda *args, **kwargs: _FakeThread(*args, **kwargs))
+    @patch("launcher.run_all._terminate_process")
     @patch("builtins.input", return_value="")
-    @patch("scripts.run_all.subprocess.Popen")
+    @patch("launcher.run_all.subprocess.Popen")
     def test_main_waits_for_enter_after_child_clean_exit(
         self,
         popen_mock,
@@ -94,7 +96,7 @@ class RunAllTests(unittest.TestCase):
             run_all._append_runtime_event(project_dir, "first line")
             run_all._append_runtime_event(project_dir, "second line")
 
-            log_path = project_dir / "runtime" / "run_all-exit.log"
+            log_path = project_dir / "tmp" / "runtime" / "run_all-exit.log"
             content = log_path.read_text(encoding="utf-8")
 
         self.assertIn("first line", content)
@@ -106,17 +108,36 @@ class RunAllTests(unittest.TestCase):
         stdout = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp_dir:
             fake_python = str(Path(tmp_dir) / "python.exe")
-            with patch("scripts.run_all.Path.resolve", return_value=Path(tmp_dir) / "scripts" / "run_all.py"):
+            with patch("launcher.run_all.Path.resolve", return_value=Path(tmp_dir) / "launcher" / "run_all.py"):
                 with patch("sys.executable", fake_python):
                     with patch("sys.stdout", new=stdout):
                         exit_code = run_all.main()
 
-            log_path = Path(tmp_dir) / "runtime" / "run_all-exit.log"
+            log_path = Path(tmp_dir) / "tmp" / "runtime" / "run_all-exit.log"
             content = log_path.read_text(encoding="utf-8")
 
         self.assertEqual(exit_code, 1)
         self.assertIn(f"[run] python executable: {fake_python}", stdout.getvalue())
         self.assertIn(f"[run] python executable: {fake_python}", content)
+
+    def test_cleanup_runtime_artifacts_removes_old_tmp_children(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            recent_dir = project_dir / "tmp" / "17track-debug" / "recent"
+            old_dir = project_dir / "tmp" / "17track-debug" / "old"
+            recent_dir.mkdir(parents=True)
+            old_dir.mkdir(parents=True)
+
+            old_time = (datetime.now() - timedelta(days=10)).timestamp()
+            recent_time = (datetime.now() - timedelta(days=1)).timestamp()
+            for path, timestamp in ((old_dir, old_time), (recent_dir, recent_time)):
+                path.touch(exist_ok=True)
+                os.utime(path, (timestamp, timestamp))
+
+            run_all.cleanup_runtime_artifacts(project_dir, retention_days=7)
+
+            self.assertFalse(old_dir.exists())
+            self.assertTrue(recent_dir.exists())
 
 
 if __name__ == "__main__":

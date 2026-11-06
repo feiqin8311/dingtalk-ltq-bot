@@ -4,6 +4,42 @@ import logistics_query
 
 
 class ExtractBaosenTrackItemsTests(unittest.TestCase):
+    def test_extract_baosen_track_items_uses_time_embedded_in_current_timeline(self):
+        html = """
+        <div class="trajectory-box">
+          <ul class="el-timeline trajectory-line">
+            <li class="el-timeline-item timeline">
+              <div class="el-timeline-item__content">
+                <div class="operation"><span>HZUK26070290 在 2026-08-12 10:08:31已离港 NINGBO CHINA。</span></div>
+              </div>
+              <div class="el-timeline-item__timestamp is-bottom"></div>
+            </li>
+            <li class="el-timeline-item timeline">
+              <div class="el-timeline-item__content">
+                <div class="operation"><span>HZUK26070290预计 2026-09-21 10:30:00到港</span></div>
+              </div>
+              <div class="el-timeline-item__timestamp is-bottom"></div>
+            </li>
+            <li class="el-timeline-item timeline">
+              <div class="el-timeline-item__content">
+                <div class="operation"><span>HZUK26070290 航次信息：OOCL FELIXSTOWE011W，订舱确认。</span></div>
+              </div>
+            </li>
+          </ul>
+        </div>
+        """
+
+        items = logistics_query.extract_baosen_track_items_from_html(html)
+
+        self.assertEqual(
+            items,
+            [
+                {"时间": "2026-08-12 10:08:31", "内容": "HZUK26070290 在 2026-08-12 10:08:31已离港 NINGBO CHINA。"},
+                {"时间": "2026-09-21 10:30:00", "内容": "HZUK26070290预计 2026-09-21 10:30:00到港"},
+                {"时间": "", "内容": "HZUK26070290 航次信息：OOCL FELIXSTOWE011W，订舱确认。"},
+            ],
+        )
+
     def test_extract_baosen_track_items_keeps_items_after_customs(self):
         html = """
         <ul class="el-timeline trajectory-line">

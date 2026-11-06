@@ -148,9 +148,10 @@ class CdpProfileCleanupTests(unittest.TestCase):
         popen_mock = mock.Mock()
         popen_mock.poll.return_value = None
         popen_mock.pid = 43210
-        pid_file = Path(f"/tmp/dingtalk-ltq-cdp-{logistics_query.LOCAL_CDP_PORT}.pid")
+        pid_file = Path("tmp") / "cdp" / f"dingtalk-ltq-cdp-{logistics_query.LOCAL_CDP_PORT}.pid"
         if pid_file.exists():
             pid_file.unlink()
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir, \

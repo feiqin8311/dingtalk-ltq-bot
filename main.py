@@ -28,15 +28,19 @@ from logistics_query import (
     query_agl,
     query_17track,
     query_baosen,
+    query_yinghe,
     query_pingyi,
     decide_platform,
     decide_tracking_platform,
+    get_logistics_nos,
     get_primary_logistics_no,
+    combine_tracking_results_by_logistics_no,
     get_dingtalk_access_token,
     run_browser_tracking_query_with_queue,
 )
 from qq_query import query_qq, send_qq_question
 from wechat_query import get_wechat_provider, query_wechat
+from services.tracking_runtime import run_tracking_query_attempt_with_timeout
 from pathlib import Path
 from dingtalk_stream.utils import DINGTALK_OPENAPI_ENDPOINT
 
@@ -50,12 +54,55 @@ logger = logging.getLogger(__name__)
 _MESSAGE_DEDUP_TTL_SECONDS = 300
 _TRACK_QUERY_MAX_ATTEMPTS = 3
 _TRACK_QUERY_RETRY_DELAY_SECONDS = 2
+_DINGTALK_REPLY_TIMEOUT_SECONDS = 8
+_DINGTALK_STREAM_LOGGING_GUARD_INSTALLED = False
+_ORIGINAL_LOGGER_EXCEPTION = logging.Logger.exception
 _BUSINESS_MENU_TEXT = (
     "请选择要办理的业务：\n"
     "1. FBA查询\n"
     "2. 跟踪号查询\n\n"
     "回复【重置】➡️ 放弃本次并重新选择业务"
 )
+
+
+def _install_dingtalk_stream_logging_guard() -> None:
+    global _DINGTALK_STREAM_LOGGING_GUARD_INSTALLED
+    if _DINGTALK_STREAM_LOGGING_GUARD_INSTALLED:
+        return
+
+    def guarded_exception(self, msg, *args, exc_info=True, **kwargs):
+        if self.name.startswith('dingtalk_stream') and args and '%' not in str(msg):
+            msg = f"{msg}: {' '.join(str(arg) for arg in args)}"
+            args = ()
+        return _ORIGINAL_LOGGER_EXCEPTION(self, msg, *args, exc_info=exc_info, **kwargs)
+
+    logging.Logger.exception = guarded_exception
+    _DINGTALK_STREAM_LOGGING_GUARD_INSTALLED = True
+
+
+def _detect_initial_conversation_mode(text: str) -> str:
+    normalized = (text or '').strip().upper()
+    if not normalized:
+        return ''
+    if normalized.startswith('FBA'):
+        return 'fba'
+
+    platform = decide_tracking_platform(normalized)
+    if platform in {
+        'uniuni',
+        'gofo',
+        'fedex',
+        'usps',
+        'ups',
+        'yuntrack',
+        'amazon_uk',
+        'swiship_ca',
+        'amazon_us',
+    }:
+        return 'tracking'
+    if platform == '17track_en' and re.fullmatch(r'[A-Z0-9-]{10,40}', normalized):
+        return 'tracking'
+    return ''
 
 
 def _parse_track_time(value: str) -> datetime | None:
@@ -179,6 +226,7 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
 
     async def process(self, callback: dingtalk_stream.CallbackMessage):
         """处理接收到的消息"""
+        incoming_message = None
         try:
             incoming_message = dingtalk_stream.ChatbotMessage.from_dict(callback.data)
             self._purge_expired_messages()
@@ -204,7 +252,7 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
             if incoming_message.message_type == 'text':
                 if not message_content:
                     self.logger.info("收到空文本消息 - 发送者: %s", sender_nick)
-                    self.reply_text("请发送纯文本格式的FBA编号进行查询", incoming_message)
+                    await self._reply_text_async("请发送纯文本格式的FBA编号进行查询", incoming_message)
                     return dingtalk_stream.AckMessage.STATUS_OK, 'EMPTY_TEXT'
                 await self._handle_text_message(incoming_message, message_content)
             else:
@@ -213,12 +261,17 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                     sender_nick,
                     incoming_message.message_type,
                 )
-                self.reply_text("请发送FBA编号进行查询", incoming_message)
+                await self._reply_text_async("请发送FBA编号进行查询", incoming_message)
 
             return dingtalk_stream.AckMessage.STATUS_OK, 'OK'
 
         except Exception as e:
             self.logger.error(f"处理消息失败: {e}", exc_info=True)
+            if incoming_message is not None:
+                try:
+                    await self._reply_text_async(f"❌ 查询失败: {str(e)}", incoming_message)
+                except Exception:
+                    self.logger.error("发送失败提示消息时出错", exc_info=True)
             return dingtalk_stream.AckMessage.STATUS_OK, 'ERROR'
 
     def _build_message_dedup_key(self, callback, incoming_message, message_content: str) -> str:
@@ -257,8 +310,45 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
     def _set_conversation_mode(self, conversation_id: str, mode: str) -> None:
         self._conversation_modes[conversation_id] = mode
 
-    def _reply_business_menu(self, incoming_message) -> None:
-        self.reply_text(_BUSINESS_MENU_TEXT, incoming_message)
+    def reply_text(self, text: str, incoming_message):
+        request_headers = {
+            'Content-Type': 'application/json',
+            'Accept': '*/*',
+        }
+        values = {
+            'msgtype': 'text',
+            'text': {
+                'content': text,
+            },
+            'at': {
+                'atUserIds': [incoming_message.sender_staff_id],
+            },
+        }
+        started_at = time.monotonic()
+        try:
+            response_text = ''
+            response = requests.post(
+                incoming_message.session_webhook,
+                headers=request_headers,
+                data=json.dumps(values),
+                timeout=_DINGTALK_REPLY_TIMEOUT_SECONDS,
+            )
+            response_text = response.text
+            response.raise_for_status()
+        except Exception as e:
+            self.logger.error('reply text failed, error=%s, response.text=%s', e, response_text)
+            return None
+        finally:
+            elapsed = time.monotonic() - started_at
+            if elapsed >= 2:
+                self.logger.warning("钉钉文本回复耗时较长 elapsed=%.2fs", elapsed)
+        return response.json()
+
+    async def _reply_text_async(self, text: str, incoming_message):
+        return await asyncio.to_thread(self.reply_text, text, incoming_message)
+
+    async def _reply_business_menu(self, incoming_message) -> None:
+        await self._reply_text_async(_BUSINESS_MENU_TEXT, incoming_message)
 
     async def _handle_fba_message(self, incoming_message, text_content: str):
         await self._handle_fba_query(incoming_message, text_content)
@@ -274,30 +364,39 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
 
         if normalized_text == '重置':
             self._set_conversation_mode(conversation_id, 'menu')
-            self._reply_business_menu(incoming_message)
+            await self._reply_business_menu(incoming_message)
             return
 
         if not mode:
+            inferred_mode = _detect_initial_conversation_mode(normalized_text)
+            if inferred_mode == 'fba':
+                self._set_conversation_mode(conversation_id, 'fba')
+                await self._handle_fba_message(incoming_message, text_content)
+                return
+            if inferred_mode == 'tracking':
+                self._set_conversation_mode(conversation_id, 'tracking')
+                await self._handle_tracking_message(incoming_message, text_content)
+                return
             self._set_conversation_mode(conversation_id, 'menu')
-            self._reply_business_menu(incoming_message)
+            await self._reply_business_menu(incoming_message)
             return
 
         if mode == 'menu':
             if normalized_text == '1':
                 self._set_conversation_mode(conversation_id, 'fba')
-                self.reply_text(
+                await self._reply_text_async(
                     '已切换到 FBA查询。后续消息将按 FBA 查询处理，回复【重置】可重新选择业务。',
                     incoming_message,
                 )
                 return
             if normalized_text == '2':
                 self._set_conversation_mode(conversation_id, 'tracking')
-                self.reply_text(
+                await self._reply_text_async(
                     '已切换到 跟踪号查询。后续消息将按跟踪号查询处理，回复【重置】可重新选择业务。',
                     incoming_message,
                 )
                 return
-            self._reply_business_menu(incoming_message)
+            await self._reply_business_menu(incoming_message)
             return
 
         if mode == 'fba':
@@ -309,7 +408,7 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
             return
 
         self._set_conversation_mode(conversation_id, 'menu')
-        self._reply_business_menu(incoming_message)
+        await self._reply_business_menu(incoming_message)
         return
 
     async def _handle_fba_query(self, incoming_message, text_content: str):
@@ -318,13 +417,13 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         fba_code = text_content.strip()
 
         if not fba_code:
-            self.reply_text("请发送要查询的FBA编号", incoming_message)
+            await self._reply_text_async("请发送要查询的FBA编号", incoming_message)
             return
 
         wechat_query_value = _extract_wechat_query_value(text_content)
         if wechat_query_value:
             self.logger.info("开始微信查询 query=%s", wechat_query_value)
-            self.reply_text(f"收到，开始走微信查询 {wechat_query_value} ...", incoming_message)
+            await self._reply_text_async(f"收到，开始走微信查询 {wechat_query_value} ...", incoming_message)
             try:
                 result = await asyncio.to_thread(query_wechat, wechat_query_value)
                 error = str(result.get('错误', '') or '').strip()
@@ -347,20 +446,20 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                             + (f"{track_time}: {track_content}" if track_time else track_content)
                         )
                     reply_text = ''.join(reply_lines)
-                self.reply_text(reply_text, incoming_message)
+                await self._reply_text_async(reply_text, incoming_message)
                 self.logger.info("微信查询完成 query=%s", wechat_query_value)
             except Exception as e:
                 self.logger.error("微信查询失败: %s", e, exc_info=True)
-                self.reply_text(f"❌ 微信查询失败: {str(e)}", incoming_message)
+                await self._reply_text_async(f"❌ 微信查询失败: {str(e)}", incoming_message)
             return
 
         # 先回复收到
         self.logger.info("开始查询 FBA=%s", fba_code)
-        self.reply_text(f"收到，开始查询 {fba_code} ...", incoming_message)
+        await self._reply_text_async(f"收到，开始查询 {fba_code} ...", incoming_message)
 
         # 查询表格
         try:
-            order = find_order_by_fba(fba_code)
+            order = await asyncio.to_thread(find_order_by_fba, fba_code)
 
             if order:
                 # 格式化回复消息
@@ -368,17 +467,14 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                 platform = decide_platform(order, 'auto')
                 if platform == 'qq':
                     qq_result = await self._query_qq_preview(order, fba_code)
-                    if qq_result.get('需要QQ询问'):
-                        reply_text += self._format_tracking_result(qq_result, 'qq')
-                        self.reply_text(reply_text, incoming_message)
-                        self._schedule_qq_question(order, fba_code)
-                    elif qq_result.get('需要异步跟进'):
+                    if qq_result.get('需要异步跟进'):
                         reply_text += self._build_qq_pending_reply(order)
-                        self.reply_text(reply_text, incoming_message)
+                        await self._reply_text_async(reply_text, incoming_message)
                         self._schedule_qq_follow_up(incoming_message, order, fba_code)
                     else:
+                        # 自动群内 @ 询问已停用，改为仅在回复里提示人工跟进。
                         reply_text += self._format_tracking_result(qq_result, 'qq')
-                        self.reply_text(reply_text, incoming_message)
+                        await self._reply_text_async(reply_text, incoming_message)
                     self.logger.info("查询完成 FBA=%s", fba_code)
                     return
 
@@ -388,31 +484,29 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
             else:
                 reply_text = f"❌ 未找到FBA编号 {fba_code} 的记录"
 
-            self.reply_text(reply_text, incoming_message)
+            await self._reply_text_async(reply_text, incoming_message)
             self.logger.info("查询完成 FBA=%s", fba_code)
 
         except Exception as e:
             self.logger.error(f"查询失败: {e}", exc_info=True)
-            self.reply_text(f"❌ 查询失败: {str(e)}", incoming_message)
+            await self._reply_text_async(f"❌ 查询失败: {str(e)}", incoming_message)
 
     async def _handle_tracking_query(self, incoming_message, text_content: str):
         tracking_no = text_content.strip()
         if not tracking_no:
-            self.reply_text("请发送要查询的跟踪号", incoming_message)
+            await self._reply_text_async("请发送要查询的跟踪号", incoming_message)
             return
-        self.reply_text(f"收到，开始查询跟踪号 {tracking_no} ...", incoming_message)
+        await self._reply_text_async(f"收到，开始查询跟踪号 {tracking_no} ...", incoming_message)
         platform_key = decide_tracking_platform(tracking_no)
-        if platform_key in SERIAL_BROWSER_TRACKING_PLATFORMS:
-            result = await run_browser_tracking_query_with_queue(
-                platform=platform_key.upper(),
-                query_value=tracking_no,
-                operation=lambda: query_tracking_number(tracking_no),
-            )
-        else:
-            result = await query_tracking_number(tracking_no)
+        result = await self._run_tracking_query_with_queue(
+            platform=platform_key.upper(),
+            platform_key=platform_key,
+            query_value=tracking_no,
+            operation=lambda: query_tracking_number(tracking_no),
+        )
         reply_text = self._format_tracking_result(result, 'tracking')
         if reply_text:
-            self.reply_text(reply_text, incoming_message)
+            await self._reply_text_async(reply_text, incoming_message)
 
     def _build_qq_pending_reply(self, order: dict) -> str:
         tracking_no = get_primary_logistics_no(order)
@@ -472,11 +566,11 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
     async def _run_qq_follow_up(self, incoming_message, order: dict, fba_code: str) -> None:
         try:
             result = await self._query_qq_result(order, fba_code)
-            self._reply_qq_result(incoming_message, fba_code, result)
+            await self._reply_qq_result(incoming_message, fba_code, result)
             self.logger.info("QQ 异步回推完成 FBA=%s", fba_code)
         except Exception as e:
             self.logger.error("QQ 异步回推失败 FBA=%s error=%s", fba_code, e, exc_info=True)
-            self.reply_text(f"📦 FBA编号: {fba_code}\n\n❌ QQ 查询失败: {str(e)}", incoming_message)
+            await self._reply_text_async(f"📦 FBA编号: {fba_code}\n\n❌ QQ 查询失败: {str(e)}", incoming_message)
 
     async def _query_qq_result(self, order: dict, fba_code: str) -> dict:
         tracking_no = get_primary_logistics_no(order)
@@ -495,18 +589,18 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
             operation=lambda: asyncio.to_thread(query_qq, order, tracking_no),
         )
 
-    def _reply_qq_result(self, incoming_message, fba_code: str, result: dict) -> None:
+    async def _reply_qq_result(self, incoming_message, fba_code: str, result: dict) -> None:
         tracking_info = self._format_tracking_result(result, 'qq')
         if not tracking_info:
             self.logger.info("QQ 异步回推跳过空结果 FBA=%s", fba_code)
             return
         reply_text = f"📦 FBA编号: {fba_code}{tracking_info}"
-        self.reply_text(reply_text, incoming_message)
+        await self._reply_text_async(reply_text, incoming_message)
 
         latest_track = result.get('最新轨迹') or {}
         attachments = latest_track.get('附件') or []
         if attachments:
-            self._reply_qq_attachments(incoming_message, attachments)
+            await asyncio.to_thread(self._reply_qq_attachments, incoming_message, attachments)
 
     def _reply_qq_attachments(self, incoming_message, attachments: list[dict]) -> None:
         for index, attachment in enumerate(attachments, start=1):
@@ -656,10 +750,24 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         if platform == 'tracking':
             result = attach_tracking_result_link(result)
         normalized_platform = str(result.get('平台', platform) or platform).strip()
+        per_number_results = result.get('物流编号查询结果')
+        if isinstance(per_number_results, list):
+            lines = [f'📦 {normalized_platform}物流轨迹（按物流编号）:']
+            for item in per_number_results:
+                if not isinstance(item, dict):
+                    continue
+                logistics_no = str(item.get('物流编号') or item.get('查询值') or '').strip()
+                if logistics_no:
+                    lines.append(f'📜 物流编号: {logistics_no}')
+                item_text = self._format_tracking_result(item, platform, query_value=logistics_no)
+                if item_text:
+                    lines.append(item_text)
+            return '\n'.join(lines) if len(lines) > 1 else ''
         display_query_value = (query_value or result.get('查询值') or '').strip()
         tracks = _deduplicate_tracks(
             [_normalize_track_content(track) for track in _sort_tracks_newest_first(result.get('物流轨迹') or [])]
         )
+        notice = str(result.get('提示', '') or '').strip()
 
         if not tracks:
             error = str(result.get('错误', '') or '').strip()
@@ -677,13 +785,19 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                     display_query_value,
                     error,
                 )
-                return f"⚠️ 物流轨迹查询失败: {error}"
+                message = f"⚠️ 物流轨迹查询失败: {error}"
+                if notice:
+                    message = f"{message}\n📌 {notice}"
+                return message
             self.logger.info(
                 "轨迹查询结果: 平台=%s 查询值=%s 无轨迹",
                 normalized_platform,
                 display_query_value,
             )
-            return f"暂无{normalized_platform.upper()}物流轨迹信息"
+            message = f"暂无{normalized_platform.upper()}物流轨迹信息"
+            if notice:
+                message = f"{message}\n📌 {notice}"
+            return message
 
         latest_track = tracks[0]
         self.logger.info(
@@ -703,6 +817,8 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         result_source = str(result.get('结果来源', '') or '').strip()
         if result_source:
             lines.append(f"📚 结果来源: {result_source}")
+        if notice:
+            lines.append(f"📌 {notice}")
 
         tracking_link = str(result.get('物流链接', '') or '').strip()
         if platform == 'tracking' and tracking_link:
@@ -791,11 +907,12 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
     async def _query_tracking_info(self, order: dict, fba_code: str) -> str:
         platform = decide_platform(order, 'auto')
         tracking_no = get_primary_logistics_no(order)
+        logistics_nos = get_logistics_nos(order)
 
         if platform == 'none':
             return ''
 
-        if platform in {'meitong', 'agl', 'baosen', 'qq', '17track'} and not tracking_no:
+        if platform in {'meitong', 'agl', 'baosen', 'qq', '17track', 'yinghe'} and not tracking_no:
             return '\n\n⚠️ 钉钉表格中缺少物流编号，暂时无法查询物流轨迹'
 
         try:
@@ -805,7 +922,8 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                 result = await self._run_tracking_query_with_retry(
                     platform='美通',
                     query_value=query_value,
-                    operation=lambda: query_meitong(query_value),
+                    operation=lambda: asyncio.to_thread(query_meitong, query_value),
+                    enforce_attempt_timeout=False,
                 )
             elif platform == 'agl':
                 query_value = tracking_no
@@ -815,6 +933,7 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                     platform_key=platform,
                     query_value=query_value,
                     operation=lambda: asyncio.to_thread(query_agl, query_value, order, False),
+                    enforce_attempt_timeout=False,
                 )
             elif platform == 'pingyi':
                 # 平谊直接使用用户发送的单号查询，不依赖钉钉表里的物流编号
@@ -827,14 +946,19 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                     operation=lambda: query_pingyi(query_value),
                 )
             elif platform == 'baosen':
-                query_value = tracking_no
-                self.logger.info("轨迹查询: 平台=堡森 物流编号=%s", query_value)
-                result = await self._run_tracking_query_with_queue(
-                    platform='堡森',
-                    platform_key=platform,
-                    query_value=query_value,
-                    operation=lambda: query_baosen(query_value),
-                )
+                self.logger.info("轨迹查询: 平台=堡森 物流编号=%s", ','.join(logistics_nos))
+                baosen_results: list[tuple[str, dict]] = []
+                for logistics_no in logistics_nos:
+                    query_value = logistics_no
+                    result = await self._run_tracking_query_with_queue(
+                        platform='堡森',
+                        platform_key=platform,
+                        query_value=query_value,
+                        operation=lambda logistics_no=logistics_no: query_baosen(logistics_no),
+                    )
+                    baosen_results.append((logistics_no, result))
+                result = combine_tracking_results_by_logistics_no('堡森', baosen_results)
+                query_value = ','.join(logistics_nos)
             elif platform == 'qq':
                 query_value = tracking_no
                 self.logger.info("轨迹查询: 平台=QQ 物流编号=%s", query_value)
@@ -842,6 +966,7 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                     platform='QQ',
                     query_value=query_value,
                     operation=lambda: asyncio.to_thread(query_qq, order, query_value),
+                    enforce_attempt_timeout=False,
                 )
             elif platform == '17track':
                 query_value = tracking_no
@@ -852,6 +977,15 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                     query_value=query_value,
                     operation=lambda: query_17track(query_value),
                 )
+            elif platform == 'yinghe':
+                query_value = tracking_no
+                self.logger.info("轨迹查询: 平台=盈和 物流编号=%s", query_value)
+                result = await self._run_tracking_query_with_queue(
+                    platform='盈和',
+                    platform_key=platform,
+                    query_value=query_value,
+                    operation=lambda: query_yinghe(query_value),
+                )
             else:
                 return ''
         except Exception as e:
@@ -860,17 +994,42 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
 
         return self._format_tracking_result(result, platform, query_value=query_value)
 
-    async def _run_tracking_query_with_queue(self, platform: str, platform_key: str, query_value: str, operation):
+    async def _run_tracking_query_with_queue(
+        self,
+        platform: str,
+        platform_key: str,
+        query_value: str,
+        operation,
+        *,
+        enforce_attempt_timeout: bool = True,
+    ):
         if platform_key not in SERIAL_BROWSER_TRACKING_PLATFORMS:
-            return await self._run_tracking_query_with_retry(platform, query_value, operation)
+            return await self._run_tracking_query_with_retry(
+                platform,
+                query_value,
+                operation,
+                enforce_attempt_timeout=enforce_attempt_timeout,
+            )
 
         return await run_browser_tracking_query_with_queue(
             platform=platform,
             query_value=query_value,
-            operation=lambda: self._run_tracking_query_with_retry(platform, query_value, operation),
+            operation=lambda: self._run_tracking_query_with_retry(
+                platform,
+                query_value,
+                operation,
+                enforce_attempt_timeout=enforce_attempt_timeout,
+            ),
         )
 
-    async def _run_qq_query_with_queue(self, platform: str, query_value: str, operation):
+    async def _run_qq_query_with_queue(
+        self,
+        platform: str,
+        query_value: str,
+        operation,
+        *,
+        enforce_attempt_timeout: bool = True,
+    ):
         queued_ahead = self._qq_queue_waiting
         if self._qq_query_lock.locked():
             self._qq_queue_waiting += 1
@@ -891,7 +1050,12 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                 query_value,
                 self._qq_queue_waiting,
             )
-            return await self._run_tracking_query_with_retry(platform, query_value, operation)
+            return await self._run_tracking_query_with_retry(
+                platform,
+                query_value,
+                operation,
+                enforce_attempt_timeout=enforce_attempt_timeout,
+            )
         finally:
             self._qq_query_lock.release()
             self.logger.info(
@@ -900,15 +1064,25 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
                 self._qq_queue_waiting,
             )
 
-    async def _run_tracking_query_with_retry(self, platform: str, query_value: str, operation):
+    async def _run_tracking_query_with_retry(
+        self,
+        platform: str,
+        query_value: str,
+        operation,
+        *,
+        enforce_attempt_timeout: bool = True,
+    ):
         last_error: Exception | None = None
         last_result: dict | None = None
 
         for attempt in range(1, _TRACK_QUERY_MAX_ATTEMPTS + 1):
             try:
-                result = operation()
-                if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
-                    result = await result
+                if enforce_attempt_timeout:
+                    result = await run_tracking_query_attempt_with_timeout(platform, query_value, operation)
+                else:
+                    result = operation()
+                    if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+                        result = await result
 
                 if self._should_retry_tracking_result(platform, result):
                     error = str((result or {}).get('错误', '')).strip() or '未知错误'
@@ -963,6 +1137,31 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
         if result.get('物流轨迹'):
             return False
         normalized_platform = str(platform or '').strip().upper()
+        if normalized_platform == 'FEDEX':
+            non_retryable_markers = (
+                'FedEx 系统错误页',
+                'fedextrack/system-error',
+                'system-error',
+            )
+            if any(marker in error for marker in non_retryable_markers):
+                return False
+        if normalized_platform == 'USPS':
+            non_retryable_markers = (
+                'Akamai',
+                'ISTL-REFERER',
+                'X-Akamai',
+                '当前浏览器会话需要人工打开 USPS',
+            )
+            if any(marker in error for marker in non_retryable_markers):
+                return False
+        if normalized_platform == 'AGL' and result.get('阻塞原因') in {
+            'MFA_REQUIRED',
+            'MANUAL_LOGIN_TIMEOUT',
+            'LOGIN_NOT_COMPLETED',
+            'ZINIAO_AGL_LOGIN_REQUIRED',
+            'TRACKING_NOT_RENDERED',
+        }:
+            return False
         if normalized_platform == 'QQ':
             non_retryable_markers = (
                 '等待 QQ 回复超时',
@@ -977,11 +1176,16 @@ class LogisticsBotHandler(dingtalk_stream.ChatbotHandler):
             )
             if any(marker in error for marker in non_retryable_markers):
                 return False
+        if normalized_platform == '平谊':
+            if '未找到 FBA' in error:
+                return False
         return True
 
 
 def main():
     """主函数"""
+    _install_dingtalk_stream_logging_guard()
+
     # 加载环境变量
     env_path = Path(__file__).with_name('.env')
     load_dotenv(env_path)
