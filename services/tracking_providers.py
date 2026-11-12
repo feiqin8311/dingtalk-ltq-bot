@@ -1,3 +1,4 @@
+import os
 import random
 import re
 import time
@@ -5,6 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
+
+from services import runtime_artifacts as runtime_artifacts_service
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,33 @@ class TrackingProviderDeps:
     extract_usps_tracking_items_from_html: Callable[[str], list[dict[str, str]]] | None = None
 
 
+def _provider_project_dir() -> Path:
+    path = Path(__file__)
+    resolved_path = path.resolve()
+    try:
+        return resolved_path.parents[1]
+    except (IndexError, TypeError):
+        return path
+
+
+def _safe_join_path(base: Any, *parts: str) -> Any:
+    path = base
+    for part in parts:
+        try:
+            path = path / part
+        except TypeError:
+            return base
+    return path
+
+
+def get_17track_result_wait_seconds() -> int:
+    raw_value = os.environ.get('TRACKING_17TRACK_MAX_WAIT_SECONDS', '25').strip()
+    try:
+        return min(90, max(10, int(raw_value)))
+    except ValueError:
+        return 25
+
+
 async def query_17track_provider(order_no: str, deps: TrackingProviderDeps) -> dict[str, Any]:
     from playwright.async_api import async_playwright
 
@@ -46,8 +77,42 @@ async def query_17track_provider(order_no: str, deps: TrackingProviderDeps) -> d
         raise RuntimeError('17TRACK provider dependencies are incomplete')
 
     normalized = normalize_tracking_number(order_no)
-    query_url = f'https://t.17track.net/en#nums={normalized}'
+    query_url = f'https://t.17track.net/en#nums={quote(normalized)}'
+    max_wait_seconds = get_17track_result_wait_seconds()
+    project_dir = _provider_project_dir()
     logger.info("17TRACK 查询: order_no=%s", order_no)
+
+    async def dump_17track_debug_artifacts(page) -> tuple[str, str, str]:
+        title = ''
+        url = page.url
+        try:
+            title = await page.title()
+        except Exception:
+            title = ''
+        html = ''
+        try:
+            html = await page.content()
+        except Exception:
+            html = ''
+        try:
+            debug_dir = runtime_artifacts_service.debug_dir(project_dir, '17track', datetime.now().strftime('%Y-%m-%d'))
+        except TypeError:
+            debug_dir = project_dir
+        debug_dir = _safe_join_path(debug_dir, normalized)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        html_path = _safe_join_path(debug_dir, 'dom.html')
+        screenshot_path = _safe_join_path(debug_dir, 'screenshot.png')
+        url_path = _safe_join_path(debug_dir, 'url.txt')
+        title_path = _safe_join_path(debug_dir, 'title.txt')
+        html_path.write_text(html or '', encoding='utf-8')
+        url_path.write_text(url or '', encoding='utf-8')
+        title_path.write_text(title or '', encoding='utf-8')
+        try:
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+        except Exception:
+            pass
+        logger.warning("17TRACK 查询调试文件已保存 order_no=%s title=%s url=%s dir=%s", normalized, title, url, debug_dir)
+        return title, url, str(html_path)
 
     async def dismiss_17track_guide_popup(page) -> bool:
         popup_selectors = ['div.tooltip__body[role="alertdialog"]', 'div.tooltip__body']
@@ -96,7 +161,15 @@ async def query_17track_provider(order_no: str, deps: TrackingProviderDeps) -> d
         return any(pattern in body_text for pattern in text_patterns)
 
     async def detect_not_found_result(page) -> str:
-        text_patterns = ['Not found', 'Tracking Not Available', 'The carrier has not updated the information', 'try switching carrier and then check again']
+        text_patterns = [
+            'Not found',
+            'Tracking Not Available',
+            'The carrier has not updated the information',
+            'try switching carrier and then check again',
+            'Please check if the tracking number is correct',
+            'Select carrier',
+            'If auto-detection is incorrect or unknown, please designate carrier manually.',
+        ]
         try:
             html = await page.content()
         except Exception:
@@ -106,6 +179,11 @@ async def query_17track_provider(order_no: str, deps: TrackingProviderDeps) -> d
             return '17TRACK 未查询到轨迹信息，请确认单号或切换承运商后重试'
         if 'Tracking Not Available'.lower() in normalized_html.lower():
             return '17TRACK 未查询到轨迹信息，请确认单号是否有效'
+        if (
+            'not found' in normalized_html.lower()
+            and 'please check if the tracking number is correct' in normalized_html.lower()
+        ):
+            return '17TRACK 未查询到轨迹信息，请确认单号或切换承运商后重试'
         try:
             body_text = await page.locator('body').inner_text(timeout=1000)
         except Exception:
@@ -116,44 +194,247 @@ async def query_17track_provider(order_no: str, deps: TrackingProviderDeps) -> d
                 return '17TRACK 未查询到轨迹信息，请确认单号或切换承运商后重试'
         return ''
 
+    async def detect_not_found_result_card(page) -> str:
+        try:
+            html = await page.content()
+        except Exception:
+            html = ''
+        normalized_html = clean_text(html).lower()
+        if (
+            'not found' in normalized_html
+            and 'select carrier' in normalized_html
+            and 'please check if the tracking number is correct' in normalized_html
+        ):
+            return '17TRACK 未查询到轨迹信息，请确认单号或切换承运商后重试'
+        return ''
+
+    async def detect_loading_result_page(page) -> bool:
+        loading_patterns = [
+            'loading results',
+            'loading',
+            'searching',
+            'tracking...',
+            'please wait',
+        ]
+        try:
+            html = await page.content()
+        except Exception:
+            html = ''
+        normalized_html = clean_text(html).lower()
+        if any(pattern in normalized_html for pattern in loading_patterns):
+            return True
+        try:
+            body_text = await page.locator('body').inner_text(timeout=1000)
+        except Exception:
+            body_text = ''
+        normalized_body_text = clean_text(body_text).lower()
+        return any(pattern in normalized_body_text for pattern in loading_patterns)
+
+    async def detect_transient_page_error(page) -> str:
+        error_patterns = (
+            'something went wrong',
+            'request failed',
+            'network error',
+            'service unavailable',
+            'internal server error',
+            'too many requests',
+            'access denied',
+            'bad gateway',
+            'gateway timeout',
+        )
+        try:
+            body_text = await page.locator('body').inner_text(timeout=1000)
+        except Exception:
+            body_text = ''
+        normalized_body_text = clean_text(body_text).lower()
+        for pattern in error_patterns:
+            if pattern in normalized_body_text:
+                return f'17TRACK 页面暂时不可用: {pattern}'
+        return ''
+
+    async def dismiss_17track_walkthrough(page) -> bool:
+        guide_selectors = [
+            'button[title="Next"]',
+            'button[aria-label="Next"]',
+            'button:has-text("Next")',
+            'button[title="Finish"]',
+            'button[aria-label="Finish"]',
+            'button:has-text("Finish")',
+        ]
+        clicked_any = False
+        for _ in range(6):
+            clicked = False
+            for selector in guide_selectors:
+                button = page.locator(selector).first
+                try:
+                    if await button.count() > 0 and await button.is_visible(timeout=300):
+                        try:
+                            await button.hover(timeout=1000)
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(250)
+                        try:
+                            await button.click(timeout=2000)
+                        except Exception:
+                            await page.evaluate(
+                                """(selector) => {
+                                    const node = document.querySelector(selector);
+                                    if (!node) return false;
+                                    node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                                    return true;
+                                }""",
+                                selector,
+                            )
+                        await page.wait_for_timeout(500)
+                        clicked_any = True
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                return clicked_any
+        return clicked_any
+
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        context, page, owns_context = await open_cdp_query_page(browser, force_new_context=True, viewport={'width': 1440, 'height': 900})
+        # Reuse the persistent CDP profile so a completed 17TRACK verification survives later queries.
+        context, page, owns_context = await open_cdp_query_page(browser, viewport={'width': 1440, 'height': 900})
         try:
+            deadline = time.monotonic() + max_wait_seconds
             await apply_browser_stealth(context, page, platform='17TRACK')
-            await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
+            await page.goto(query_url, wait_until='domcontentloaded', timeout=max_wait_seconds * 1000)
             await page.wait_for_timeout(1200)
             await dismiss_17track_guide_popup(page)
+            await dismiss_17track_walkthrough(page)
+            try:
+                await page.wait_for_load_state('domcontentloaded', timeout=10000)
+            except Exception:
+                pass
+            try:
+                await page.wait_for_load_state('networkidle', timeout=5000)
+            except Exception:
+                pass
+            await dismiss_17track_walkthrough(page)
+            await page.wait_for_timeout(1200)
             captcha_detected = False
+            settled_result_iterations = 0
+            loading_iterations = 0
             timeline_root = page.locator('span.yq-time').first
             for _ in range(180):
-                await dismiss_17track_guide_popup(page)
+                if time.monotonic() >= deadline:
+                    title, current_url, html_path = await dump_17track_debug_artifacts(page)
+                    return {
+                        '平台': '17TRACK',
+                        '查询值': normalized,
+                        '当前页面标题': title,
+                        '当前URL': current_url,
+                        '最新轨迹': {},
+                        '物流轨迹': [],
+                        '错误': f'17TRACK 页面加载超过 {max_wait_seconds} 秒，已关闭本次查询并准备重试',
+                        '调试HTML': html_path,
+                    }
+                guide_popup_closed = await dismiss_17track_guide_popup(page)
+                walkthrough_closed = await dismiss_17track_walkthrough(page)
+                if guide_popup_closed or walkthrough_closed:
+                    settled_result_iterations = 0
+                    await page.wait_for_timeout(700)
+                    continue
                 if await detect_human_verification(page):
                     if not captcha_detected:
                         captcha_detected = True
                         logger.warning("17TRACK 查询: 检测到人机验证，请先在浏览器中完成验证，程序将继续等待")
                     await page.wait_for_timeout(800)
                     continue
-                not_found_error = await detect_not_found_result(page)
-                if not_found_error:
-                    return {'平台': '17TRACK', '查询值': normalized, '当前页面标题': await page.title(), '当前URL': page.url, '最新轨迹': {}, '物流轨迹': [], '错误': not_found_error}
+                transient_error = await detect_transient_page_error(page)
+                if transient_error:
+                    title, current_url, html_path = await dump_17track_debug_artifacts(page)
+                    return {
+                        '平台': '17TRACK',
+                        '查询值': normalized,
+                        '当前页面标题': title,
+                        '当前URL': current_url,
+                        '最新轨迹': {},
+                        '物流轨迹': [],
+                        '错误': transient_error,
+                        '调试HTML': html_path,
+                    }
                 try:
                     if await timeline_root.count() > 0 and await timeline_root.is_visible(timeout=300):
                         break
                 except Exception:
                     pass
+                current_url = getattr(page, 'url', '') or ''
+                result_card_error = await detect_not_found_result_card(page)
+                if result_card_error:
+                    return {'平台': '17TRACK', '查询值': normalized, '当前页面标题': await page.title(), '当前URL': page.url, '最新轨迹': {}, '物流轨迹': [], '错误': result_card_error}
+                if await detect_loading_result_page(page):
+                    loading_iterations += 1
+                    settled_result_iterations = 0
+                    await page.wait_for_timeout(900)
+                    continue
+                not_found_error = ''
+                if loading_iterations >= 2 or ('17track.net' in current_url and '#nums=' in current_url):
+                    not_found_error = await detect_not_found_result(page)
+                if not_found_error:
+                    return {'平台': '17TRACK', '查询值': normalized, '当前页面标题': await page.title(), '当前URL': page.url, '最新轨迹': {}, '物流轨迹': [], '错误': not_found_error}
+                if '17track.net' in current_url and '#nums=' in current_url:
+                    settled_result_iterations += 1
+                else:
+                    settled_result_iterations = 0
+                if settled_result_iterations >= 20:
+                    title, current_url, html_path = await dump_17track_debug_artifacts(page)
+                    return {
+                        '平台': '17TRACK',
+                        '查询值': normalized,
+                        '当前页面标题': title,
+                        '当前URL': current_url,
+                        '最新轨迹': {},
+                        '物流轨迹': [],
+                        '错误': '17TRACK 页面未返回轨迹信息',
+                        '调试HTML': html_path,
+                    }
                 await page.wait_for_timeout(700)
             else:
                 if captcha_detected:
-                    raise RuntimeError('17TRACK 人机验证等待超时，请完成验证后重试')
-                raise RuntimeError('17TRACK 查询超时，未获取到轨迹结果')
+                    title, current_url, html_path = await dump_17track_debug_artifacts(page)
+                    return {
+                        '平台': '17TRACK',
+                        '查询值': normalized,
+                        '当前页面标题': title,
+                        '当前URL': current_url,
+                        '最新轨迹': {},
+                        '物流轨迹': [],
+                        '错误': '17TRACK 人机验证等待超时，请完成验证后重试',
+                        '调试HTML': html_path,
+                    }
+                title, current_url, html_path = await dump_17track_debug_artifacts(page)
+                return {
+                    '平台': '17TRACK',
+                    '查询值': normalized,
+                    '当前页面标题': title,
+                    '当前URL': current_url,
+                    '最新轨迹': {},
+                    '物流轨迹': [],
+                    '错误': '17TRACK 查询超时，未获取到轨迹结果',
+                    '调试HTML': html_path,
+                }
             await page.wait_for_timeout(800)
             timeline_container = page.locator('span.yq-time').locator('xpath=ancestor::div[contains(@class,"relative")][1]').first
             html = await timeline_container.inner_html(timeout=15000)
             track_items = sort_tracks_newest_first(extract_17track_items_from_html(html))
             if not track_items:
-                return {'平台': '17TRACK', '查询值': normalized, '当前页面标题': await page.title(), '当前URL': page.url, '最新轨迹': {}, '物流轨迹': [], '错误': '17TRACK 页面未返回轨迹信息'}
+                title, current_url, html_path = await dump_17track_debug_artifacts(page)
+                return {
+                    '平台': '17TRACK',
+                    '查询值': normalized,
+                    '当前页面标题': title,
+                    '当前URL': current_url,
+                    '最新轨迹': {},
+                    '物流轨迹': [],
+                    '错误': '17TRACK 页面未返回轨迹信息',
+                    '调试HTML': html_path,
+                }
             latest_track = track_items[0] if track_items else {'时间': '', '内容': ''}
             logger.info("17TRACK 查询: 轨迹条数=%s", len(track_items))
             return {'平台': '17TRACK', '查询值': normalized, '当前页面标题': await page.title(), '当前URL': page.url, '最新轨迹': latest_track, '物流轨迹': track_items}
@@ -177,13 +458,15 @@ async def query_fedex_provider(tracking_no: str, deps: TrackingProviderDeps) -> 
     type_like_human = deps.type_like_human
 
     normalized = normalize_tracking_number(tracking_no)
-    query_url = 'https://www.fedex.com/en-us/home.html'
+    direct_query_url = f'https://www.fedex.com/wtrk/track/?trknbr={quote(normalized)}'
+    homepage_url = 'https://www.fedex.com/en-us/home.html'
+    project_dir = _provider_project_dir()
     logger.info("FedEx 查询: tracking_no=%s", normalized)
 
     cdp_process = begin_local_cdp_session()
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
-        context, page, owns_context = await open_cdp_query_page(browser, force_new_context=True, viewport={'width': 1440, 'height': 900})
+        context, page, owns_context = await open_cdp_query_page(browser, viewport={'width': 1440, 'height': 900})
         try:
             await apply_browser_stealth(context, page, platform='FEDEX')
 
@@ -199,7 +482,7 @@ async def query_fedex_provider(tracking_no: str, deps: TrackingProviderDeps) -> 
                     html = await page.content()
                 except Exception:
                     html = ''
-                debug_dir = Path('tmp') / 'fedex-debug' / datetime.now().strftime('%Y-%m-%d')
+                debug_dir = runtime_artifacts_service.debug_dir(project_dir, 'fedex', datetime.now().strftime('%Y-%m-%d'))
                 debug_dir.mkdir(parents=True, exist_ok=True)
                 html_path = debug_dir / f'{normalized}.html'
                 screenshot_path = debug_dir / f'{normalized}.png'
@@ -211,29 +494,204 @@ async def query_fedex_provider(tracking_no: str, deps: TrackingProviderDeps) -> 
                 logger.warning("FedEx 查询调试文件已保存 tracking_no=%s title=%s url=%s html=%s screenshot=%s", normalized, title, url, html_path, screenshot_path)
                 return title, url, str(html_path)
 
+            async def _handle_geo_locator_modal() -> bool:
+                try:
+                    geo_title = page.locator('.fxg-u-modal__content .fxg-geo-locator__title').first
+                    if not (
+                        await geo_title.count() > 0
+                        and await geo_title.is_visible(timeout=1000)
+                    ):
+                        return False
+                except Exception:
+                    return False
+
+                clickable_geo_selectors = [
+                    '.fxg-u-modal__content a.fxg-geo-locator__country-url[href="https://www.fedex.com/en-us/home.html"]',
+                    '.fxg-u-modal__content a.fxg-geo-locator__country-url[data-analytics="link|GEO-EN-US"]',
+                    '.fxg-u-modal__content a.fxg-geo-locator__country-url[data-country-code="us"][aria-label="English"]',
+                ]
+                for geo_selector in clickable_geo_selectors:
+                    try:
+                        geo_link = page.locator(geo_selector).first
+                        if await geo_link.count() > 0 and await geo_link.is_visible(timeout=1000):
+                            await geo_link.click(timeout=5000)
+                            await page.wait_for_timeout(1000)
+                            logger.info("FedEx 查询: 已选择地区弹窗美国英文 selector=%s", geo_selector)
+                            return True
+                    except Exception:
+                        continue
+                plain_href_selectors = [
+                    '.fxg-u-modal__content a[href="https://www.fedex.com/en-us/home.html"]',
+                ]
+                for geo_selector in plain_href_selectors:
+                    try:
+                        geo_link = page.locator(geo_selector).first
+                        if await geo_link.count() > 0 and await geo_link.is_visible(timeout=1000):
+                            href = (await geo_link.get_attribute('href') or '').strip()
+                            if href:
+                                await page.goto(href, wait_until='domcontentloaded', timeout=60000)
+                                await page.wait_for_timeout(1000)
+                                logger.info("FedEx 查询: 已通过地区链接跳转美国英文 selector=%s href=%s", geo_selector, href)
+                                return True
+                    except Exception:
+                        continue
+                return False
+
             goto_error = ''
             for attempt in range(1, 3):
                 try:
-                    await page.goto(query_url, wait_until='domcontentloaded', timeout=60000)
+                    await page.goto(direct_query_url, wait_until='domcontentloaded', timeout=60000)
                     goto_error = ''
                     break
                 except Exception as exc:
                     goto_error = str(exc)
-                    logger.warning("FedEx 查询: 页面打开失败 tracking_no=%s attempt=%s error=%s", normalized, attempt, exc)
+                    logger.warning("FedEx 查询: 直接结果页打开失败 tracking_no=%s attempt=%s error=%s", normalized, attempt, exc)
                     if attempt >= 2:
-                        title, current_url, html_path = await _dump_debug_artifacts()
-                        return {'平台': 'FEDEX', '查询值': normalized, '物流轨迹': [], '最新轨迹': {}, '错误': f'FedEx 查询页面连接失败: {goto_error}', '当前页面标题': title, '当前URL': current_url, '调试HTML': html_path}
+                        break
                     await page.wait_for_timeout(random.randint(1500, 2800))
 
-            cookie_button = page.locator('#accept').first
-            try:
-                if await cookie_button.count() > 0 and await cookie_button.is_visible(timeout=1000):
-                    await cookie_button.click(timeout=5000)
-                    await page.wait_for_timeout(600)
-            except Exception:
-                pass
+            async def _accept_fedex_cookies() -> bool:
+                cookie_selectors = [
+                    '#accept',
+                    '#onetrust-accept-btn-handler',
+                    'button.uc-accept-button',
+                    'button.accept.uc-accept-button',
+                    '.uc-accept-button',
+                    '.accept.uc-accept-button',
+                    'button[data-action-type="accept"]',
+                    '[data-action="consent"][data-action-type="accept"]',
+                    'button:has-text("ACCEPT ALL COOKIES")',
+                    'button:has-text("Accept All Cookies")',
+                ]
+                for _ in range(3):
+                    for cookie_selector in cookie_selectors:
+                        try:
+                            cookie_button = page.locator(cookie_selector).first
+                            if await cookie_button.count() > 0 and await cookie_button.is_visible(timeout=700):
+                                try:
+                                    await cookie_button.click(timeout=4000)
+                                except Exception:
+                                    await cookie_button.click(timeout=4000, force=True)
+                                await page.wait_for_timeout(600)
+                                logger.info("FedEx 查询: 已接受 cookie selector=%s", cookie_selector)
+                                return True
+                        except Exception:
+                            continue
+                    await page.wait_for_timeout(500)
+                try:
+                    clicked = await page.evaluate(
+                        """
+                        () => {
+                            const selectors = [
+                                '#accept',
+                                '#onetrust-accept-btn-handler',
+                                'button.uc-accept-button',
+                                'button.accept.uc-accept-button',
+                                '.uc-accept-button',
+                                '.accept.uc-accept-button',
+                                'button[data-action-type="accept"]',
+                                '[data-action="consent"][data-action-type="accept"]',
+                            ];
+                            const textMatchers = ['ACCEPT ALL COOKIES', 'ACCEPT ALL', 'ACCEPT COOKIES'];
+                            const candidates = [];
+                            for (const selector of selectors) {
+                                candidates.push(...document.querySelectorAll(selector));
+                            }
+                            for (const node of document.querySelectorAll('button, a, div, span')) {
+                                const text = (node.textContent || '').trim().toUpperCase();
+                                if (text && textMatchers.some((matcher) => text.includes(matcher))) {
+                                    candidates.push(node);
+                                }
+                            }
+                            const seen = new Set();
+                            let touched = false;
+                            for (const node of candidates) {
+                                if (!node || seen.has(node)) {
+                                    continue;
+                                }
+                                seen.add(node);
+                                try {
+                                    node.click();
+                                    touched = true;
+                                } catch (e) {}
+                                const event = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                                try {
+                                    node.dispatchEvent(event);
+                                    touched = true;
+                                } catch (e) {}
+                                const host = node.closest('div, section, aside, dialog') || node;
+                                if (host instanceof HTMLElement) {
+                                    host.style.display = 'none';
+                                    host.style.visibility = 'hidden';
+                                    host.style.pointerEvents = 'none';
+                                }
+                            }
+                            return touched;
+                        }
+                        """
+                    )
+                    if clicked:
+                        await page.wait_for_timeout(600)
+                        logger.info("FedEx 查询: 已通过脚本接受/隐藏 cookie 横幅")
+                        return True
+                except Exception:
+                    pass
+                return False
+
+            async def _force_hide_fedex_cookie_banner() -> bool:
+                try:
+                    await page.evaluate(
+                        """
+                        () => {
+                            const selectors = [
+                                '#accept',
+                                '#usercentrics-cmp-ui',
+                                '#usercentrics-root',
+                                '[data-nosnippet="1"]#usercentrics-cmp-ui',
+                                '.uc-embedding-container',
+                                '.uc-overlay',
+                                '.uc-banner-content',
+                                '.uc-accept-button',
+                                '[data-action="consent"][data-action-type="accept"]',
+                                '.cookie-banner',
+                                '.cookie-consent',
+                                'fedex-cookie-consent',
+                            ];
+                            let touched = false;
+                            for (const selector of selectors) {
+                                for (const node of document.querySelectorAll(selector)) {
+                                    const host = node.closest('div, section, aside, dialog') || node;
+                                    host.style.display = 'none';
+                                    host.style.visibility = 'hidden';
+                                    host.style.pointerEvents = 'none';
+                                    touched = true;
+                                }
+                            }
+                            for (const node of Array.from(document.querySelectorAll('button, a, div, section')).filter((el) => {
+                                const text = (el.textContent || '').trim().toUpperCase();
+                                return text.includes('ACCEPT ALL COOKIES') || text.includes('REJECT OPTIONAL COOKIES') || text.includes('COOKIE PREFERENCES');
+                            })) {
+                                const host = node.closest('div, section, aside, dialog') || node;
+                                host.style.display = 'none';
+                                host.style.visibility = 'hidden';
+                                host.style.pointerEvents = 'none';
+                                touched = true;
+                            }
+                            return touched;
+                        }
+                        """
+                    )
+                    await page.wait_for_timeout(200)
+                    return True
+                except Exception:
+                    return False
+
+            fedex_modal_closed = False
 
             async def _close_fedex_modal() -> bool:
+                nonlocal fedex_modal_closed
+                if fedex_modal_closed:
+                    return False
                 close_selectors = [
                     'a.fxg-u-modal__close.js-modal-close[title="close"]',
                     'a.fxg-u-modal__close.js-modal-close',
@@ -245,23 +703,204 @@ async def query_fedex_provider(tracking_no: str, deps: TrackingProviderDeps) -> 
                         if await close_button.count() > 0 and await close_button.is_visible(timeout=800):
                             await close_button.click(timeout=3000)
                             await page.wait_for_timeout(700)
+                            fedex_modal_closed = True
                             logger.info("FedEx 查询: 已关闭首页弹窗 selector=%s", close_selector)
                             return True
                     except Exception:
                         continue
                 return False
 
-            await _close_fedex_modal()
-
-            tracking_input_selector = 'input[type="text"][placeholder="Tracking number"]'
-            track_button_selector = 'button.fxp-c-form__button.fxp-c-button--primary.fxp-c-button--primary-condensed'
-            tracking_input = page.locator(tracking_input_selector).first
-            try:
-                await tracking_input.wait_for(timeout=30000)
-            except Exception as exc:
-                await _close_fedex_modal()
+            async def _force_dismiss_fedex_dialog() -> bool:
                 try:
-                    await tracking_input.wait_for(timeout=8000)
+                    await page.evaluate(
+                        """
+                        () => {
+                            const dialogs = Array.from(document.querySelectorAll('dialog.fxg-u-modal.js-modal.is-open'));
+                            if (!dialogs.length) {
+                                return false;
+                            }
+                            for (const dialog of dialogs) {
+                                try {
+                                    if (typeof dialog.close === 'function') {
+                                        dialog.close();
+                                    }
+                                } catch (e) {}
+                                dialog.removeAttribute('open');
+                                dialog.setAttribute('aria-hidden', 'true');
+                                dialog.classList.remove('is-open');
+                                dialog.style.display = 'none';
+                                dialog.style.pointerEvents = 'none';
+                                const backdrop = dialog.parentElement;
+                                if (backdrop && backdrop !== document.body && backdrop.classList.contains('fxg-u-modal__content')) {
+                                    backdrop.style.pointerEvents = 'none';
+                                }
+                            }
+                            return true;
+                        }
+                        """
+                    )
+                    await page.wait_for_timeout(200)
+                    return True
+                except Exception:
+                    return False
+
+            async def _settle_fedex_overlays(rounds: int = 4) -> None:
+                for _ in range(rounds):
+                    geo_selected = await _handle_geo_locator_modal()
+                    await _accept_fedex_cookies()
+                    await _force_hide_fedex_cookie_banner()
+                    if not geo_selected:
+                        await _close_fedex_modal()
+                    await _force_dismiss_fedex_dialog()
+                    await page.wait_for_timeout(400)
+
+            async def _parse_fedex_result_page(progress_timeout: int, *, allow_homepage_fallback: bool) -> dict[str, Any] | None:
+                if 'system-error' in page.url:
+                    title, current_url, html_path = await _dump_debug_artifacts()
+                    return {'平台': 'FEDEX', '查询值': normalized, '物流轨迹': [], '最新轨迹': {}, '错误': 'FedEx 系统错误页，暂时无法查询', '当前页面标题': title, '当前URL': current_url, '调试HTML': html_path}
+
+                progress_container = page.locator('div.shipment-status-progress-container').first
+                try:
+                    await progress_container.wait_for(timeout=progress_timeout)
+                except Exception:
+                    if 'system-error' in page.url:
+                        title, current_url, html_path = await _dump_debug_artifacts()
+                        return {'平台': 'FEDEX', '查询值': normalized, '物流轨迹': [], '最新轨迹': {}, '错误': 'FedEx 系统错误页，暂时无法查询', '当前页面标题': title, '当前URL': current_url, '调试HTML': html_path}
+                    try:
+                        page_text = clean_text(await page.locator('body').first.inner_text())
+                    except Exception:
+                        page_text = ''
+                    normalized_page_text = page_text.lower()
+                    if (
+                        "can't find that tracking number" in normalized_page_text
+                        or 'can’t find that tracking number' in normalized_page_text
+                        or 'check with the shipper' in normalized_page_text
+                    ):
+                        title, current_url, html_path = await _dump_debug_artifacts()
+                        return {
+                            '平台': 'FEDEX',
+                            '查询值': normalized,
+                            '物流轨迹': [],
+                            '最新轨迹': {},
+                            '错误': 'FedEx 未查到该跟踪号，请确认单号是否正确',
+                            '当前页面标题': title,
+                            '当前URL': current_url,
+                            '调试HTML': html_path,
+                        }
+                    if allow_homepage_fallback:
+                        logger.warning("FedEx 查询: 直接结果页未返回轨迹，回退首页流程 tracking_no=%s url=%s", normalized, page.url)
+                        return None
+                    title, current_url, html_path = await _dump_debug_artifacts()
+                    return {
+                        '平台': 'FEDEX',
+                        '查询值': normalized,
+                        '物流轨迹': [],
+                        '最新轨迹': {},
+                        '错误': 'FedEx 结果页未返回轨迹信息，请稍后重试或确认单号是否正确',
+                        '当前页面标题': title,
+                        '当前URL': current_url,
+                        '调试HTML': html_path,
+                    }
+
+                active_step = page.locator('div.shipment-status-progress-step.active').first
+                await active_step.wait_for(timeout=15000)
+                content_nodes = active_step.locator('span.shipment-status-progress-step-label-content')
+                content_values: list[str] = []
+                try:
+                    count = await content_nodes.count()
+                except Exception:
+                    count = 0
+                for index in range(count):
+                    try:
+                        text = clean_text(await content_nodes.nth(index).inner_text())
+                    except Exception:
+                        text = ''
+                    if text:
+                        content_values.append(text)
+                active_text = clean_text(await active_step.inner_text())
+                status = content_values[0] if len(content_values) >= 1 else ''
+                location = content_values[1] if len(content_values) >= 2 else ''
+                time_text = content_values[2] if len(content_values) >= 3 else ''
+                if not status:
+                    lines = [clean_text(line) for line in active_text.splitlines() if clean_text(line)]
+                    if len(lines) >= 4:
+                        status = lines[1]
+                        location = lines[2]
+                        time_text = lines[3]
+                    elif len(lines) >= 3:
+                        status = lines[0]
+                        location = lines[1]
+                        time_text = lines[2]
+                    elif len(lines) >= 1:
+                        status = lines[-1]
+                latest_track = {
+                    '时间': time_text,
+                    '地点': location,
+                    '内容': status or active_text,
+                }
+                return {'平台': 'FEDEX', '查询值': normalized, '当前页面标题': await page.title(), '当前URL': page.url, '最新轨迹': latest_track, '物流轨迹': [latest_track] if any(latest_track.values()) else []}
+
+            await _settle_fedex_overlays()
+            current_url_after_direct = getattr(page, 'url', '') or ''
+            if not goto_error and ('/wtrk/track' in current_url_after_direct or '/fedextrack/' in current_url_after_direct):
+                direct_result = await _parse_fedex_result_page(12000, allow_homepage_fallback=True)
+                if direct_result is not None:
+                    return direct_result
+
+            goto_error = ''
+            for attempt in range(1, 3):
+                try:
+                    await page.goto(homepage_url, wait_until='domcontentloaded', timeout=60000)
+                    goto_error = ''
+                    break
+                except Exception as exc:
+                    goto_error = str(exc)
+                    logger.warning("FedEx 查询: 首页打开失败 tracking_no=%s attempt=%s error=%s", normalized, attempt, exc)
+                    if attempt >= 2:
+                        title, current_url, html_path = await _dump_debug_artifacts()
+                        return {'平台': 'FEDEX', '查询值': normalized, '物流轨迹': [], '最新轨迹': {}, '错误': f'FedEx 查询页面连接失败: {goto_error}', '当前页面标题': title, '当前URL': current_url, '调试HTML': html_path}
+                    await page.wait_for_timeout(random.randint(1500, 2800))
+
+            await _settle_fedex_overlays()
+
+            tracking_input_selectors = [
+                'input[type="text"][placeholder="Tracking number"]:visible',
+                '#trackingModuleTrackingNum:visible',
+                'input[type="text"][placeholder="Tracking ID"]:visible',
+                'input[name="trackingNumber"]:visible',
+            ]
+            track_button_selectors = [
+                'button.fxp-c-form__button.fxp-c-button--primary.fxp-c-button--primary-condensed:visible',
+                'button.cc-aem-c-button.cc-aem-c-button--primary:visible',
+                'button[type="submit"][aria-label*="track" i]:visible',
+            ]
+
+            async def _find_visible_locator(selectors: list[str], timeout_ms: int):
+                last_exc: Exception | None = None
+                for selector in selectors:
+                    locator = page.locator(selector).first
+                    try:
+                        await locator.wait_for(timeout=timeout_ms)
+                        return selector, locator
+                    except Exception as exc:
+                        last_exc = exc
+                        continue
+                if last_exc is not None:
+                    raise last_exc
+                raise RuntimeError('no selectors configured')
+
+            try:
+                tracking_input_selector, tracking_input = await _find_visible_locator(
+                    tracking_input_selectors,
+                    30000,
+                )
+            except Exception as exc:
+                await _settle_fedex_overlays()
+                try:
+                    tracking_input_selector, tracking_input = await _find_visible_locator(
+                        tracking_input_selectors,
+                        8000,
+                    )
                 except Exception:
                     title, current_url, html_path = await _dump_debug_artifacts()
                     return {
@@ -274,6 +913,7 @@ async def query_fedex_provider(tracking_no: str, deps: TrackingProviderDeps) -> 
                         '当前URL': current_url,
                         '调试HTML': html_path,
                     }
+            await _settle_fedex_overlays(rounds=2)
             if type_like_human is not None:
                 await type_like_human(page, tracking_input_selector, normalized, delay_range=(90, 180))
             else:
@@ -284,57 +924,25 @@ async def query_fedex_provider(tracking_no: str, deps: TrackingProviderDeps) -> 
                 current_value = ''
             if current_value and current_value != normalized:
                 logger.warning("FedEx 查询: 输入框值不一致 tracking_no=%s actual=%s", normalized, current_value)
-            track_button = page.locator(track_button_selector).first
-            await track_button.wait_for(timeout=12000)
+            await _settle_fedex_overlays(rounds=2)
             await page.wait_for_timeout(random.randint(500, 1100))
-            await track_button.click(timeout=8000)
-            await page.wait_for_timeout(random.randint(1200, 2200))
-
-            if 'system-error' in page.url:
-                title, current_url, html_path = await _dump_debug_artifacts()
-                return {'平台': 'FEDEX', '查询值': normalized, '物流轨迹': [], '最新轨迹': {}, '错误': 'FedEx 系统错误页，暂时无法查询', '当前页面标题': title, '当前URL': current_url, '调试HTML': html_path}
-
-            progress_container = page.locator('div.shipment-status-progress-container').first
             try:
-                await progress_container.wait_for(timeout=30000)
+                track_button_selector, track_button = await _find_visible_locator(track_button_selectors, 12000)
             except Exception:
-                if 'system-error' in page.url:
-                    title, current_url, html_path = await _dump_debug_artifacts()
-                    return {'平台': 'FEDEX', '查询值': normalized, '物流轨迹': [], '最新轨迹': {}, '错误': 'FedEx 系统错误页，暂时无法查询', '当前页面标题': title, '当前URL': current_url, '调试HTML': html_path}
-                raise
-            active_step = page.locator('div.shipment-status-progress-step.active').first
-            await active_step.wait_for(timeout=15000)
-            content_nodes = active_step.locator('span.shipment-status-progress-step-label-content')
-            content_values: list[str] = []
-            try:
-                count = await content_nodes.count()
-            except Exception:
-                count = 0
-            for index in range(count):
+                track_button_selector, track_button = '', None
+            if track_button is not None:
                 try:
-                    text = clean_text(await content_nodes.nth(index).inner_text())
+                    await track_button.click(timeout=8000)
                 except Exception:
-                    text = ''
-                if text:
-                    content_values.append(text)
-            active_text = clean_text(await active_step.inner_text())
-            status = content_values[0] if len(content_values) >= 1 else ''
-            location = content_values[1] if len(content_values) >= 2 else ''
-            time_text = content_values[2] if len(content_values) >= 3 else ''
-            if not status:
-                lines = [clean_text(line) for line in active_text.splitlines() if clean_text(line)]
-                if len(lines) >= 4:
-                    status = lines[1]
-                    location = lines[2]
-                    time_text = lines[3]
-                elif len(lines) >= 3:
-                    status = lines[0]
-                    location = lines[1]
-                    time_text = lines[2]
-                elif len(lines) >= 1:
-                    status = lines[-1]
-            latest_track = {'时间': time_text, '地点': location, '内容': status or active_text}
-            return {'平台': 'FEDEX', '查询值': normalized, '当前页面标题': await page.title(), '当前URL': page.url, '最新轨迹': latest_track, '物流轨迹': [latest_track] if any(latest_track.values()) else []}
+                    try:
+                        await _force_hide_fedex_cookie_banner()
+                        await track_button.click(timeout=8000, force=True)
+                    except Exception:
+                        await tracking_input.press('Enter')
+            else:
+                await tracking_input.press('Enter')
+            await page.wait_for_timeout(random.randint(1200, 2200))
+            return await _parse_fedex_result_page(30000, allow_homepage_fallback=False)
         finally:
             await cleanup_cdp_query_page(page, context, owns_context)
             end_local_cdp_session(cdp_process)
@@ -379,7 +987,6 @@ async def query_usps_provider(tracking_no: str, deps: TrackingProviderDeps) -> d
         browser = await p.chromium.connect_over_cdp(get_local_cdp_endpoint())
         context, page, owns_context = await open_cdp_query_page(
             browser,
-            force_new_context=True,
             viewport={'width': 1440, 'height': 900},
             user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'),
             locale='en-US',
@@ -558,17 +1165,25 @@ async def query_usps_provider(tracking_no: str, deps: TrackingProviderDeps) -> d
                         raise RuntimeError(f'USPS 查询结果页跟踪号不匹配: expected={normalized} actual={tracking_number_text or "empty"}')
                 except Exception:
                     html = await page.content()
-                    direct_items = extract_usps_tracking_items_from_html(html)
-                    if not direct_items:
-                        raise
-                    logger.info("USPS 查询: 直达结果页缺少跟踪号头部，但已解析到轨迹 tracking_no=%s", normalized)
+                    if is_usps_blocked_page_html(html):
+                        logger.warning("USPS 查询: 结果页触发风控中间页，回退首页入口 tracking_no=%s", normalized)
+                        await _submit_via_homepage()
+                        await tracking_number.wait_for(timeout=30000)
+                        tracking_number_text = clean_text(await tracking_number.inner_text())
+                        if tracking_number_text != normalized:
+                            raise RuntimeError(f'USPS 查询结果页跟踪号不匹配: expected={normalized} actual={tracking_number_text or "empty"}')
+                    else:
+                        direct_items = extract_usps_tracking_items_from_html(html)
+                        if not direct_items:
+                            raise
+                        logger.info("USPS 查询: 直达结果页缺少跟踪号头部，但已解析到轨迹 tracking_no=%s", normalized)
                 await page.wait_for_timeout(random.randint(900, 1600))
                 search_submitted = True
             except Exception as exc:
                 submit_error = str(exc)
                 logger.warning("USPS 查询: 提交查询失败 tracking_no=%s error=%s", normalized, exc)
 
-            async def _dump_debug_artifacts() -> tuple[str, str, str]:
+            async def _dump_debug_artifacts(attempt_label: str = 'attempt-1') -> tuple[str, str, str]:
                 title = ''
                 url = page.url
                 try:
@@ -576,16 +1191,20 @@ async def query_usps_provider(tracking_no: str, deps: TrackingProviderDeps) -> d
                 except Exception:
                     title = ''
                 html = await page.content()
-                debug_dir = build_usps_debug_dir()
+                debug_dir = build_usps_debug_dir() / normalized / attempt_label
                 debug_dir.mkdir(parents=True, exist_ok=True)
-                html_path = debug_dir / f'{normalized}.html'
-                screenshot_path = debug_dir / f'{normalized}.png'
+                html_path = debug_dir / 'dom.html'
+                screenshot_path = debug_dir / 'screenshot.png'
+                url_path = debug_dir / 'url.txt'
+                title_path = debug_dir / 'title.txt'
                 html_path.write_text(html, encoding='utf-8')
+                url_path.write_text(url or '', encoding='utf-8')
+                title_path.write_text(title or '', encoding='utf-8')
                 try:
                     await page.screenshot(path=str(screenshot_path), full_page=True)
                 except Exception:
                     pass
-                logger.warning("USPS 查询调试文件已保存 tracking_no=%s title=%s url=%s html=%s screenshot=%s", normalized, title, url, html_path, screenshot_path)
+                logger.warning("USPS 查询调试文件已保存 tracking_no=%s title=%s url=%s dir=%s", normalized, title, url, debug_dir)
                 return title, url, str(html_path)
 
             if not search_submitted:

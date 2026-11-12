@@ -96,6 +96,36 @@ class GatewayServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error"], "未找到对应FBA记录")
         self.assertEqual(result["data"], upstream_payload["data"])
 
+    async def test_query_fba_forwards_direct_agl_logistics_number(self):
+        gateway_server = self._load_module()
+        import services.gateway_server as gateway_implementation
+
+        payload = gateway_server.FbaQueryRequest(
+            logistics_no="AL0-UC54XYYFYNEW2",
+            brand="YPLUS",
+            platform="agl",
+        )
+
+        with patch.object(
+            gateway_implementation,
+            "_proxy_post",
+            return_value={"success": True, "data": {}, "error": None},
+        ) as proxy_mock:
+            result = await gateway_server.query_fba(payload)
+
+        self.assertTrue(result["success"])
+        proxy_mock.assert_called_once_with(
+            "/api/fba/query",
+            {
+                "fba_code": None,
+                "logistics_no": "AL0-UC54XYYFYNEW2",
+                "brand": "YPLUS",
+                "platform": "agl",
+                "include_order": True,
+                "include_tracking": True,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

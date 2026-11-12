@@ -1,39 +1,46 @@
 @echo off
+setlocal DisableDelayedExpansion
+cd /d "%~dp0" || exit /b 1
 chcp 65001 >nul
 net session >nul 2>&1
-if %ERRORLEVEL% == 0 (
-    echo Administrator mode detected.
-) else (
-    echo Please run this script in administrator mode.
-    powershell -Command "Start-Process 'wt.exe' -ArgumentList 'cmd /c cd /d \"%cd%\" && \"%~f0\" %*' -Verb runAs"
-    exit
-)
+if not errorlevel 1 goto :napcat_admin
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0launcher-elevate.ps1" wt.exe "%~f0" %*
+exit /b %ERRORLEVEL%
 
-set NAPCAT_PATCH_PACKAGE=%cd%\qqnt.json
-set NAPCAT_LOAD_PATH=%cd%\loadNapCat.js
-set NAPCAT_INJECT_PATH=%cd%\NapCatWinBootHook.dll
-set NAPCAT_LAUNCHER_PATH=%cd%\NapCatWinBootMain.exe
-set NAPCAT_MAIN_PATH=%cd%\napcat.mjs
-:loop_read
+:napcat_admin
+echo Administrator mode detected.
+
+set "NAPCAT_PATCH_PACKAGE=%cd%\qqnt.json"
+set "NAPCAT_LOAD_PATH=%cd%\loadNapCat.js"
+set "NAPCAT_INJECT_PATH=%cd%\NapCatWinBootHook.dll"
+set "NAPCAT_LAUNCHER_PATH=%cd%\NapCatWinBootMain.exe"
+set "NAPCAT_MAIN_PATH=%cd%\napcat.mjs"
+set "QQPath=D:\Program Files\Tencent\QQNT\QQ.exe"
+if exist "%QQPath%" goto :napcat_boot
+set "QQPath=D:\QQ\QQ.exe"
+if exist "%QQPath%" goto :napcat_boot
+set "RetString="
 for /f "tokens=2*" %%a in ('reg query "HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\QQ" /v "UninstallString"') do (
     set "RetString=%%~b"
-    goto :napcat_boot
+    goto :napcat_from_registry
 )
+echo QQ installation was not found in the registry.
+pause
+exit /b 1
 
-:napcat_boot
+:napcat_from_registry
 for %%a in ("%RetString%") do (
     set "pathWithoutUninstall=%%~dpa"
 )
-
 set "QQPath=%pathWithoutUninstall%QQ.exe"
+
+:napcat_boot
 
 if not exist "%QQPath%" (
     echo provided QQ path is invalid
     pause
-    exit /b
+    exit /b 1
 )
 
-set NAPCAT_MAIN_PATH=%NAPCAT_MAIN_PATH:\=/%
-echo (async () =^> {await import("file:///%NAPCAT_MAIN_PATH%")})() > "%NAPCAT_LOAD_PATH%"
-
 "%NAPCAT_LAUNCHER_PATH%" "%QQPath%" "%NAPCAT_INJECT_PATH%" %*
+exit /b %ERRORLEVEL%

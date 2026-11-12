@@ -7,6 +7,7 @@ import unittest
 from logistics_query import (
     build_yuntrack_download_dir,
     build_yuntrack_download_path,
+    build_yuntrack_latest_track,
     parse_yuntrack_export_summary_xlsx,
 )
 
@@ -79,8 +80,8 @@ class YunTrackQueryHelperTests(unittest.TestCase):
 
     def test_parse_yuntrack_export_summary_xlsx_reads_delivery_status(self):
         payload = _build_xlsx_bytes(
-            ["Tracking Number", "Delivery Status"],
-            ["H00RVA0498916385", "In transit"],
+            ["Tracking Number", "Last Event", "Delivery Status"],
+            ["H00RVA0498916385", "2026-06-09 07:53:12 Shipment information received", "In transit"],
         )
 
         with tempfile.NamedTemporaryFile(suffix=".xlsx") as temp_file:
@@ -89,6 +90,7 @@ class YunTrackQueryHelperTests(unittest.TestCase):
             row = parse_yuntrack_export_summary_xlsx(Path(temp_file.name))
 
         self.assertEqual(row["Delivery Status"], "In transit")
+        self.assertEqual(row["Last Event"], "2026-06-09 07:53:12 Shipment information received")
 
     def test_parse_yuntrack_export_summary_xlsx_reads_csv_payload_disguised_as_xlsx(self):
         payload = (
@@ -113,6 +115,17 @@ class YunTrackQueryHelperTests(unittest.TestCase):
             temp_file.flush()
             with self.assertRaisesRegex(RuntimeError, "Delivery Status"):
                 parse_yuntrack_export_summary_xlsx(Path(temp_file.name))
+
+    def test_build_yuntrack_latest_track_reads_time_from_last_event(self):
+        latest_track = build_yuntrack_latest_track(
+            {
+                "Delivery Status": "Processing",
+                "Last Event": "2026-06-09 07:53:12 Shipment information received",
+            }
+        )
+
+        self.assertEqual(latest_track["时间"], "2026-06-09 07:53:12")
+        self.assertEqual(latest_track["内容"], "Processing")
 
 
 if __name__ == "__main__":

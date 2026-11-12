@@ -169,6 +169,82 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(attempts, 1)
 
+    async def test_pingyi_not_found_result_is_not_retried(self):
+        handler, main_module = self._make_handler()
+        attempts = 0
+
+        async def operation():
+            nonlocal attempts
+            attempts += 1
+            return {
+                "平台": "平谊",
+                "查询值": "FBA19FDPK8TT",
+                "物流轨迹": [],
+                "最新轨迹": {},
+                "错误": "未找到 FBA FBA19FDPK8TT 的记录",
+            }
+
+        with patch.object(main_module, "_TRACK_QUERY_RETRY_DELAY_SECONDS", 0):
+            result = await handler._run_tracking_query_with_retry(
+                platform="平谊",
+                query_value="FBA19FDPK8TT",
+                operation=operation,
+            )
+
+        self.assertEqual(attempts, 1)
+        self.assertEqual(result["错误"], "未找到 FBA FBA19FDPK8TT 的记录")
+
+    async def test_usps_akamai_block_result_is_not_retried(self):
+        handler, main_module = self._make_handler()
+        attempts = 0
+
+        async def operation():
+            nonlocal attempts
+            attempts += 1
+            return {
+                "平台": "USPS",
+                "查询值": "9214490407314880398037",
+                "物流轨迹": [],
+                "最新轨迹": {},
+                "错误": "USPS Akamai 风控拦截，当前浏览器会话需要人工打开 USPS 后再重试",
+            }
+
+        with patch.object(main_module, "_TRACK_QUERY_RETRY_DELAY_SECONDS", 0):
+            result = await handler._run_tracking_query_with_retry(
+                platform="USPS",
+                query_value="9214490407314880398037",
+                operation=operation,
+            )
+
+        self.assertEqual(attempts, 1)
+        self.assertIn("Akamai", result["错误"])
+
+    async def test_agl_manual_login_timeout_is_not_retried(self):
+        handler, main_module = self._make_handler()
+        attempts = 0
+
+        async def operation():
+            nonlocal attempts
+            attempts += 1
+            return {
+                "平台": "AGL",
+                "查询值": "BOOK123",
+                "物流轨迹": [],
+                "最新轨迹": {},
+                "错误": "AGL 登录或验证码等待超时",
+                "阻塞原因": "MANUAL_LOGIN_TIMEOUT",
+            }
+
+        with patch.object(main_module, "_TRACK_QUERY_RETRY_DELAY_SECONDS", 0):
+            result = await handler._run_tracking_query_with_retry(
+                platform="AGL",
+                query_value="BOOK123",
+                operation=operation,
+            )
+
+        self.assertEqual(attempts, 1)
+        self.assertEqual(result["阻塞原因"], "MANUAL_LOGIN_TIMEOUT")
+
     def test_qq_timeout_formats_as_empty_reply(self):
         handler, _ = self._make_handler()
 
@@ -185,12 +261,12 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(text, "")
 
-    def test_reply_qq_result_skips_async_push_when_timeout_has_no_tracks(self):
+    async def test_reply_qq_result_skips_async_push_when_timeout_has_no_tracks(self):
         handler, _ = self._make_handler()
         replies: list[str] = []
         handler.reply_text = lambda text, incoming_message: replies.append(text)
 
-        handler._reply_qq_result(
+        await handler._reply_qq_result(
             self._make_message(),
             "FBA19900H9WP",
             {
@@ -233,7 +309,7 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("最新物流轨迹(QQ)", replies[1])
         schedule_mock.assert_not_called()
 
-    async def test_handle_text_message_returns_stale_qq_history_and_sends_question(self):
+    async def test_handle_text_message_returns_stale_qq_history_with_manual_follow_up_notice(self):
         handler, main = self._make_handler()
         replies: list[str] = []
         handler.reply_text = lambda text, incoming_message: replies.append(text)
@@ -243,8 +319,8 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
         qq_result = {
             "平台": "QQ",
             "查询值": "KMFTORY2600585",
-            "结果来源": "群历史已超过7天，已重新发起QQ人工询问",
-            "需要QQ询问": True,
+            "结果来源": "群历史已超过7天",
+            "提示": "消息已7天未更新，请询问单证",
             "物流轨迹": [{"时间": "2026-04-07 11:18:50", "内容": "KMFTORY2600585 已离港"}],
             "最新轨迹": {"时间": "2026-04-07 11:18:50", "内容": "KMFTORY2600585 已离港"},
         }
@@ -261,9 +337,9 @@ class TrackingQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(replies), 2)
         self.assertIn("最新物流轨迹(QQ)", replies[1])
-        self.assertNotIn("结果会在收到回复后单独补发", replies[1])
+        self.assertIn("消息已7天未更新，请询问单证", replies[1])
         follow_up_mock.assert_not_called()
-        question_mock.assert_called_once()
+        question_mock.assert_not_called()
 
 
 if __name__ == "__main__":

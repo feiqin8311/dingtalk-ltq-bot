@@ -7,6 +7,7 @@ import unittest
 from logistics_query import (
     build_gofo_download_dir,
     build_gofo_download_path,
+    build_gofo_latest_track,
     parse_gofo_export_summary_xlsx,
 )
 
@@ -134,6 +135,7 @@ class GofoQueryHelperTests(unittest.TestCase):
 
         self.assertEqual(row["Current status"], "Transit")
         self.assertEqual(row["Waybill No"], "GFUS01055496346945")
+        self.assertEqual(row["Last Event"], "2026/06/08 14:34:35 Arrived at GOFO Regional Hub")
 
     def test_parse_gofo_export_summary_xlsx_reads_inline_string_cells(self):
         payload = _build_inline_str_xlsx_bytes(
@@ -171,6 +173,17 @@ class GofoQueryHelperTests(unittest.TestCase):
             temp_file.flush()
             with self.assertRaisesRegex(RuntimeError, "Current status"):
                 parse_gofo_export_summary_xlsx(Path(temp_file.name))
+
+    def test_build_gofo_latest_track_reads_time_from_last_event(self):
+        latest_track = build_gofo_latest_track(
+            {
+                "Current status": "Transit",
+                "Last Event": "2026/06/08 14:34:35 Arrived at GOFO Regional Hub",
+            }
+        )
+
+        self.assertEqual(latest_track["时间"], "2026/06/08 14:34:35")
+        self.assertEqual(latest_track["内容"], "Transit")
 
 
 if __name__ == "__main__":
